@@ -644,7 +644,13 @@ class Orchestrator:
             sm = wt / "candidate-summary.md"
             m.summary_text = sm.read_text(encoding="utf-8") if sm.exists() else ""
             if m.commit is None:
-                m.error = m.error or ("agent turn timed out" if res.exit_code == 124 else "no commit")
+                if res.exit_code == 124:
+                    default_error = "agent turn timed out"
+                elif res.error:
+                    default_error = f"opencode: {res.error}"
+                else:
+                    default_error = "no commit"
+                m.error = m.error or default_error
                 return m
             # diff.patch is the *solution* diff only: agents are told to commit
             # with `git add -A`, so the raw parent..HEAD diff drags in profiling

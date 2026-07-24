@@ -47,16 +47,66 @@ class OpencodeResult:
     cost: float
     tokens: dict[str, Any]
     exit_code: int
+    error: str | None = None
     tool_calls: int = 0
     raw_lines: list[str] = field(default_factory=list)
 
 
-def parse_ndjson(stdout: str) -> tuple[str, str | None, float, dict[str, Any], int]:
+def _error_text(ev: dict[str, Any]) -> str | None:
+    err = ev.get("error")
+    if not isinstance(err, dict):
+        return str(err) if err else None
+    name = err.get("name")
+    data = err.get("data")
+    msg = None
+    ref = None
+    if isinstance(data, dict):
+        msg = data.get("message")
+        ref = data.get("ref")
+    msg = msg or err.get("message")
+    if ref:
+        msg = f"{msg} (ref {ref})" if msg else f"ref {ref}"
+    if name and msg:
+        return f"{name}: {msg}"
+    if name:
+        return str(name)
+    if msg:
+        return str(msg)
+    return None
+
+
+def _auth_file(data_home: Path) -> Path:
+    return data_home / "opencode" / "auth.json"
+
+
+def _seed_auth_for_isolated_data(src_data_home: Path, dst_data_home: Path) -> None:
+    """Mirror opencode provider auth into an isolated XDG data dir if present.
+
+    opencode stores API keys under ``$XDG_DATA_HOME/opencode/auth.json``. The
+    evolutionary loop gives each concurrent candidate its own XDG data/cache/state
+    roots to avoid SQLite/log contention, so that fresh data dir also needs the
+    already-configured auth file. Missing or unreadable auth is left for opencode
+    to report; auth setup should not make the wrapper itself crash.
+    """
+    src = _auth_file(src_data_home)
+    dst = _auth_file(dst_data_home)
+    if src == dst or not src.is_file():
+        return
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        dst.chmod(0o600)
+    except OSError:
+        return
+
+
+def parse_ndjson(stdout: str) -> tuple[str, str | None, float, dict[str, Any], int, str | None]:
     text_parts: list[str] = []
     session_id: str | None = None
     cost = 0.0
     tokens: dict[str, Any] = {}
     tool_calls = 0
+    error: str | None = None
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -74,12 +124,14 @@ def parse_ndjson(stdout: str) -> tuple[str, str | None, float, dict[str, Any], i
             "type" in part and part["type"] in ("tool", "tool-invocation")
         ):
             tool_calls += 1
+        elif etype == "error":
+            error = _error_text(ev)
         elif etype == "step_finish":
             if part.get("cost"):
                 cost = part["cost"]
             if part.get("tokens"):
                 tokens = part["tokens"]
-    return "".join(text_parts), session_id, cost, tokens, tool_calls
+    return "".join(text_parts), session_id, cost, tokens, tool_calls, error
 
 
 def build_opencode_env(
@@ -94,6 +146,8 @@ def build_opencode_env(
     remote, so no GPU-lock shim is injected and no CUDA env is pinned.
     """
     env = dict(os.environ)
+    home = Path(os.path.expanduser("~"))
+    parent_xdg_data = Path(os.environ.get("XDG_DATA_HOME", home / ".local" / "share"))
 
     oc_config: dict[str, Any] = {"snapshot": False}
     if guard is not None:
@@ -106,6 +160,7 @@ def build_opencode_env(
     if data_dir is not None:
         data_dir = Path(data_dir)
         oc_state = [data_dir / "share", data_dir / "state", data_dir / "cache"]
+        _seed_auth_for_isolated_data(parent_xdg_data, oc_state[0])
     else:
         oc_state = opencode_state_dirs()
     env["XDG_DATA_HOME"] = str(oc_state[0])
@@ -279,13 +334,14 @@ def run(
     if log_path is None:
         os.unlink(out_name)
 
-    text, sid, cost, tokens, tool_calls = parse_ndjson(stdout)
+    text, sid, cost, tokens, tool_calls, error = parse_ndjson(stdout)
     return OpencodeResult(
         text=text,
         session_id=sid,
         cost=cost,
         tokens=tokens,
         exit_code=returncode,
+        error=error,
         tool_calls=tool_calls,
         raw_lines=stdout.splitlines(),
     )
