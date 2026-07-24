@@ -1,11 +1,10 @@
 """Asynchronous evolutionary kernel search: pure data model + selection logic.
 
 The controller (``Orchestrator.run``) owns one :class:`Population` and
-continuously dispatches mutation tasks to a worker pool, serializing **only** the
-GPU benchmark stage. (Benchmarking is not concurrency-safe: ``bench.score``
-imports the candidate module into this process and pins the GPU through a
-process-global env var, so two benches at once would corrupt each other's timing
-and module state -- agent *editing*, being API-bound, runs many-at-once.)
+continuously dispatches mutation tasks to a worker pool. Both the agent edit and
+the score run per-candidate and concurrently (up to ``-j``): scoring shells out to
+``kernelthing score``, which submits to the hosted popcorn service in its own
+process, so there is no shared in-process state to serialize.
 
 Everything in this module is pure / side-effect-free so it can be unit tested;
 the side-effecting orchestration (worktrees, agents, git) lives in
@@ -56,7 +55,6 @@ class Member:
     children: int = 0  # tasks dispatched from this member (bandit visits)
     status: str = ST_DEAD
     # --- provenance / accounting (persisted to members/<id>/result.json) ---
-    gpu: int | None = None
     cost: float = 0.0  # USD spent on the agent turn
     tokens: dict[str, Any] = field(default_factory=dict)
     tool_calls: int = 0
@@ -89,7 +87,6 @@ class Member:
             "correct": self.correct,
             "metric": self.metric,
             "error": self.error,
-            "gpu": self.gpu,
             "cost": round(self.cost, 6),
             "tokens": self.tokens,
             "tool_calls": self.tool_calls,

@@ -2,9 +2,10 @@
 
 The search logic (population, operators, selection) is pure in ``evolve.py``;
 this module is the side-effecting controller: it owns git worktrees, the agent
-turns, the serialized GPU benchmark, and the loop budget. Problem-agnostic --
+turns, the remote scoring submissions, and the loop budget. Problem-agnostic --
 the objective fitness comes from the problem's ``score`` command (JSON {correct,
-metric}); see problem.py and ``run()``.
+metric}); see problem.py and ``run()``. Grading is remote (the hosted popcorn
+service), so there is no local GPU pool or benchmark to serialize.
 
 Everything that happens is journaled to the run dir (see journal.py/state.py):
 events to ``events.ndjson``, per-candidate artifacts to ``members/<id>/``. The
@@ -14,7 +15,6 @@ arrives through ``control.json``, re-read at dispatch boundaries.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import random
@@ -23,7 +23,6 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -147,16 +146,21 @@ Keep it under 1000 characters.
 """
 
 
+def _vendored(path: Path) -> bool:
+    """Is a vendored skill dir actually populated?
+
+    ``vendor/`` holds git submodules that are frequently left uninitialised (and
+    ``git submodule update --init`` fails repo-wide here — see CLAUDE.md), so an existing
+    but empty directory is the normal broken state, not a missing one.
+    """
+    return path.is_dir() and any(path.iterdir())
+
+
 class Orchestrator:
     def __init__(self, problem: Problem, cfg: Config):
         self.problem = problem
         self.wd = Path(problem.repo_root).resolve()
         self.cfg = cfg
-        # Multi-GPU pool: track in-flight tasks per GPU index. The first GPU in
-        # the list is the "default" for operations (bootstrap, methodology) that
-        # only need one device. Dispatch picks the least-busy GPU.
-        self._gpu_indices = list(cfg.gpu_indices)
-        self._gpu_in_flight: dict[int, int] = dict.fromkeys(self._gpu_indices, 0)
         # Run-dir plumbing, created in setup(): the journal is the event record,
         # control the live-knob channel, live_lock the liveness beacon.
         self.journal: Journal | None = None
@@ -164,10 +168,6 @@ class Orchestrator:
         self._live_lock: LiveLock | None = None
         self.impl_session: str | None = None
         self._best: float | None = None
-        # Per-GPU pinned baseline (us). Keyed by GPU index. Each GPU gets its own
-        # baseline measurement so pct_baseline/speedup ratios are valid when
-        # candidates on different GPUs share one denominator.
-        self._baselines: dict[int, float | None] = dict.fromkeys(self._gpu_indices)
         self._dispatched = 0
         self._logfile: Path | None = None
         self._git_lock = threading.Lock()
@@ -195,64 +195,6 @@ class Orchestrator:
 
     def _parallelism(self) -> int:
         return self.control.parallelism() if self.control else self.cfg.parallelism
-
-    def _default_gpu(self) -> int:
-        """First GPU in the pool (for seed, methodology, and other singleton ops)."""
-        return self._gpu_indices[0]
-
-    @contextlib.contextmanager
-    def _hardware_locked(self) -> Iterator[None]:
-        """Lock GPU clocks and power limit for reproducible benchmarking.
-
-        Applied once before the seed baseline and held for the entire run;
-        reset on exit even on crash/KeyboardInterrupt. A no-op when no
-        hardware settings are configured.
-        """
-        cfg = self.cfg
-        if cfg.power_limit is None and cfg.gpu_clock_lock is None and cfg.mem_clock_lock is None:
-            yield
-            return
-        from . import gpucontrol
-
-        hw = gpucontrol.HardwareConfig(
-            power_limit_watts=cfg.power_limit,
-            gpu_clock_lock=cfg.gpu_clock_lock,
-            mem_clock_lock=cfg.mem_clock_lock,
-            device_ids=list(self._gpu_indices),
-        )
-        try:
-            with gpucontrol.HardwareLock(hw) as warnings:
-                if warnings:
-                    for w in warnings:
-                        self._log(f"HW  WARNING {w}")
-                else:
-                    parts = []
-                    if cfg.power_limit:
-                        parts.append(f"power {cfg.power_limit}W")
-                    if cfg.gpu_clock_lock:
-                        parts.append(f"gpu clk {cfg.gpu_clock_lock[0]}-{cfg.gpu_clock_lock[1]}MHz")
-                    if cfg.mem_clock_lock:
-                        parts.append(f"mem clk {cfg.mem_clock_lock[0]}-{cfg.mem_clock_lock[1]}MHz")
-                    self._log(f"HARDWARE locked: {', '.join(parts)}")
-                yield
-        finally:
-            self._log("HARDWARE reset to defaults")
-
-    def _gpu_names(self) -> dict[str, str]:
-        """Product name per pool GPU for run.json (cross-run comparability)."""
-        from . import gpupool
-
-        names: dict[str, str] = {}
-        for i in self._gpu_indices:
-            try:
-                names[str(i)] = gpupool.gpu_name(i)
-            except Exception:
-                names[str(i)] = f"GPU {i}"
-        return names
-
-    def _pick_gpu(self) -> int:
-        """Return the GPU index with fewest in-flight tasks (round-robin on ties)."""
-        return min(self._gpu_in_flight, key=lambda i: self._gpu_in_flight[i])
 
     def _budget_desc(self) -> str:
         """Human description of the real search budget -- the candidate/wall-clock
@@ -328,11 +270,55 @@ class Orchestrator:
 
         Cached: every input (cfg flags, ``sys.executable``, ``REPO_ROOT``) is
         fixed for the run, so the block is built once instead of per candidate.
+
+        A remotely-scored (popcorn) problem gets a different tool story entirely: no
+        local card to arbitrate, so the shared-GPU section is dropped, and profiling
+        goes through the hosted Nsight Compute service rather than a local ``ncu``.
         """
+        from . import popcorn
         from .config import REPO_ROOT
 
         parts: list[str] = []
         pyexe = sys.executable or "python3"
+        pop = popcorn.config_or_none(self.problem)
+        if pop is not None:
+            wiki_dir = REPO_ROOT / "vendor" / "KernelWiki"
+            ncu_dir = REPO_ROOT / "vendor" / "ncu-report-skill"
+            if self.cfg.wiki and _vendored(wiki_dir):
+                parts.append(
+                    prompts.load_and_render_safe(
+                        "claude/kernel-tools-wiki.md",
+                        "",
+                        PYTHON=pyexe,
+                        WIKI_DIR=str(wiki_dir),
+                    )
+                )
+            if self.cfg.ncu:
+                # The skill is a git submodule and is routinely uninitialised; pointing an
+                # agent at a SKILL.md that is not there just burns a turn. The profiling
+                # workflow itself does not depend on it, so only the pointer is dropped.
+                skill_note = (
+                    "\nFor deeper interpretation — the six analysis dimensions and a "
+                    f"signal→cause→fix playbook — read `{ncu_dir}/SKILL.md`, then its "
+                    "`reference/` docs as needed.\n"
+                    if _vendored(ncu_dir)
+                    else ""
+                )
+                parts.append(
+                    prompts.load_and_render_safe(
+                        "claude/kernel-tools-popcorn-ncu.md",
+                        "",
+                        PYTHON=pyexe,
+                        NCU_SKILL_NOTE=skill_note,
+                        POPCORN_BIN=popcorn.popcorn_bin(pop) or "popcorn",
+                        PROFILER_URL=popcorn.brev_profiler_url(),
+                        LEADERBOARD=pop.leaderboard,
+                        BENCHMARK_INDEX=pop.benchmark_index,
+                        SUBMISSION_FILE=pop.submission_file,
+                        SCORE_CMD=self._score_cmd_str(),
+                    )
+                )
+            return self._tools_section(parts)
         if self.cfg.sandbox:
             parts.append(
                 "### Shared GPU — allocation is automatic\n\n"
@@ -369,6 +355,11 @@ class Orchestrator:
                     NCU_PYTHONPATH=str(ncu_pp[-1]) if ncu_pp else "",
                 )
             )
+        return self._tools_section(parts)
+
+    @staticmethod
+    def _tools_section(parts: list[str]) -> str:
+        """Join the rendered tool blocks under one heading; '' when none are enabled."""
         parts = [p for p in parts if p.strip()]
         if not parts:
             return ""
@@ -410,8 +401,6 @@ class Orchestrator:
             "wall_clock_s": self.cfg.wall_clock_s,
             "elite_k": self.cfg.elite_k,
             "min_niches": self.cfg.min_niches,
-            "gpus": self._gpu_indices,
-            "gpu_names": self._gpu_names(),
             "sandbox": self.cfg.sandbox,
             "kernelguard": self.cfg.kernelguard,
         }
@@ -466,46 +455,29 @@ class Orchestrator:
             model=self.cfg.model,
             session=self.impl_session,
             timeout=self.cfg.opencode_timeout,
-            gpu_pool=self._gpu_indices,
             writable=True,
             sandboxed=self.cfg.sandbox,
             log_path=log_path,
             err_path=Path(str(log_path) + ".stderr"),
             guard=guard,
-            ncu=self.cfg.ncu,
         )
         if res.session_id:
             self.impl_session = res.session_id
         return res
 
-    def _cli_score(
-        self,
-        wt: Path,
-        gpu_index: int,
-        *,
-        baseline_median: float | None = None,
-        emit_baseline: bool = False,
-    ) -> dict[str, Any]:
+    def _cli_score(self, wt: Path) -> dict[str, Any]:
         """Score a worktree by shelling out to ``kernelthing score`` and parsing its
         JSON. Runs the *same* code path agents use, and -- crucially -- in its own
         process, so concurrent scorings never race on the shared in-process import
-        state (``bench._importable`` mutates ``sys.path``/``sys.modules``/cwd).
+        state that ``popcorn.score`` touches (submission cache, cwd).
 
         Returns the full verdict dict: ``{correct, metric, error, unit, bench}``
-        plus ``baseline_median`` when ``emit_baseline`` is set (so the seed can
-        pin it for later scores) and ``stderr_tail`` when the scorer wrote to
-        stderr. ``bench`` is the raw measurement record (per-repeat timings).
-        GPU exclusivity is handled inside the subprocess by the libktgpu shim.
+        plus ``stderr_tail`` when the scorer wrote to stderr. ``bench`` is the raw
+        measurement record from the popcorn service (per-shape timings). Grading is
+        remote, so no local GPU is involved.
         """
         prob_dir = wt / self.problem.rel_dir
-        cmd = [
-            sys.executable, "-m", "kernelthing", "score", str(prob_dir),
-            "--gpu", str(gpu_index), "--override-gpu",
-        ]
-        if emit_baseline:
-            cmd.append("--emit-baseline")
-        elif baseline_median is not None:
-            cmd += ["--baseline-median", repr(baseline_median)]
+        cmd = [sys.executable, "-m", "kernelthing", "score", str(prob_dir)]
         try:
             r = subprocess.run(
                 cmd, cwd=str(prob_dir), capture_output=True, text=True, timeout=1800
@@ -541,23 +513,21 @@ class Orchestrator:
         return bool(d.get("correct")), d.get("metric"), d.get("error"), detail
 
     def _score_worktree(
-        self, wt: Path, *, gpu_index: int = 0
+        self, wt: Path
     ) -> tuple[bool, float | None, str | None, dict[str, Any]]:
         """Score the worktree, returning (correct, metric, err, detail).
 
         Shells out to ``kernelthing score`` (one process per score -> no shared-state
-        race), pinning this GPU's baseline denominator.
+        race), which submits to the hosted popcorn service.
         """
-        baseline = self._baselines.get(gpu_index)
-        return self._score_tuple(self._cli_score(wt, gpu_index, baseline_median=baseline))
+        return self._score_tuple(self._cli_score(wt))
 
     def _guarded_score(
-        self, wt: Path, *, gpu_index: int = 0
+        self, wt: Path
     ) -> tuple[bool, float | None, str | None, dict[str, Any]]:
-        """Run the cheap static cheat gate (kernelguard) BEFORE the expensive bench:
-        a detected cheat is disqualified outright and never scored. Scoring shells
-        out to ``kernelthing score`` (see ``_cli_score``), which warm-builds the
-        kernel off-lock itself, so the benchmark only pays runtime."""
+        """Run the cheap static cheat gate (kernelguard) BEFORE the expensive remote
+        score: a detected cheat is disqualified outright and never submitted. Scoring
+        shells out to ``kernelthing score`` (see ``_cli_score``)."""
         if self.cfg.kernelguard:
             cheats = gates.kernelguard_violations(
                 self.problem.edit_files,
@@ -568,9 +538,7 @@ class Orchestrator:
             if cheats:
                 err = "kernelguard: " + ", ".join(x["file"] for x in cheats)
                 return False, None, err, {"kernelguard": cheats}
-        # GPU access is serialized by the libktgpu.so shim inside pygpubench's
-        # isolated worker (see bench._gpu_env) -- no in-process flock needed.
-        return self._score_worktree(wt, gpu_index=gpu_index)
+        return self._score_worktree(wt)
 
     # --- async evolutionary search ---
     @staticmethod
@@ -605,22 +573,19 @@ class Orchestrator:
         )
 
     def _evolve_task(
-        self, task: evolve.Task, base: str, wt_root: Path, dirs: LoopDirs, gpu_index: int
+        self, task: evolve.Task, base: str, wt_root: Path, dirs: LoopDirs
     ) -> evolve.Member:
-        """Worker: fork a worktree, run one agent turn, then (serialized) score it.
+        """Worker: fork a worktree, run one agent turn, then score it remotely.
 
         Pure git plumbing is taken under ``self._git_lock``; the agent turn and the
-        benchmark run outside it. GPU exclusivity is handled by the ``libktgpu.so``
-        LD_PRELOAD shim: the agent's processes and the bench's isolated worker
-        each flock a per-device lockfile (named in kernelthing/gpupool.py) on
-        first CUDA use. Returns the scored Member; never raises.
+        remote score run outside it. Returns the scored Member; never raises.
 
         Everything about the attempt lands in ``members/<id>/`` -- the exact
         prompt, the live agent transcript, the summary, and (when it committed)
         the diff against its parent, which survives the run's ref cleanup.
         """
         m = evolve.Member(
-            id=task.member_id, operator=task.operator, parent_id=task.parent_id, gpu=gpu_index
+            id=task.member_id, operator=task.operator, parent_id=task.parent_id
         )
         parent_commit = task.parent_commit or base
         wt = wt_root / f"m{task.member_id}"
@@ -648,7 +613,6 @@ class Orchestrator:
                 model=self.cfg.model,
                 session=None,
                 timeout=self.cfg.opencode_timeout,
-                gpu_pool=self._gpu_indices,
                 writable=True,
                 sandboxed=self.cfg.sandbox,
                 log_path=dirs.member_log(task.member_id),
@@ -656,7 +620,6 @@ class Orchestrator:
                 data_dir=wt / ".humanize" / "oc-data",
                 extra_writable=[self.wd / ".git"],
                 guard=guard,
-                ncu=self.cfg.ncu,
             )
             m.agent_s = round(time.time() - t0, 1)
             m.cost = res.cost
@@ -698,9 +661,7 @@ class Orchestrator:
             with self._git_lock:
                 gates.git(["checkout", "--", *self.problem.edit_files], wt)
             t0 = time.time()
-            m.correct, m.metric, m.error, m.score_detail = self._guarded_score(
-                wt, gpu_index=gpu_index
-            )
+            m.correct, m.metric, m.error, m.score_detail = self._guarded_score(wt)
             m.score_s = round(time.time() - t0, 1)
         except Exception as e:
             m.error = repr(e)
@@ -714,15 +675,10 @@ class Orchestrator:
 
         If it scores, it is the first elite; if not, the population starts empty and
         every operator falls back to explore (forking the base) until one works.
-
-        Baselines are measured on every GPU in the pool so each device gets its own
-        pinned denominator for pct_baseline/speedup metrics. Scoring shells out to
-        ``kernelthing score`` (see ``_cli_score``) once per GPU -- each in its own
-        process, so nothing races on shared in-process import state.
+        Scoring shells out to ``kernelthing score`` (see ``_cli_score``), which
+        submits the seed to the hosted popcorn service.
         """
         m = evolve.Member(id=pop.next_id(), operator="seed", commit=base, commit_message="baseline")
-        seed_gpu = self._default_gpu()
-        m.gpu = seed_gpu
         wt = wt_root / "seed"
         with self._git_lock:
             gates.git(["worktree", "add", "--detach", "--force", str(wt), base], self.wd)
@@ -739,26 +695,7 @@ class Orchestrator:
                     m.score_detail = {"kernelguard": cheats}
                     return m
 
-            # Score the seed and pin each GPU's baseline denominator by shelling out
-            # to `kernelthing score --emit-baseline`, once per GPU. Each score is its
-            # own process, so there is no shared-state race.
-            for gpu in self._gpu_indices:
-                correct, metric, err, detail = self._score_tuple(
-                    self._cli_score(wt, gpu, emit_baseline=True)
-                )
-                bl = detail.get("baseline_median")
-                if gpu == seed_gpu:
-                    m.correct, m.metric, m.error, m.score_detail = correct, metric, err, detail
-                if bl is not None:
-                    self._baselines[gpu] = bl
-                    self._emit("baseline_pinned", gpu=gpu, median_us=bl)
-                    self._log(
-                        f"GPU {gpu} baseline pinned: {bl:.1f}us"
-                        + (" (= 100%, fixed for the run)" if gpu == seed_gpu else "")
-                    )
-                elif err:
-                    self._emit("baseline_failed", gpu=gpu, error=err)
-                    self._log(f"GPU {gpu} baseline pin failed ({err})")
+            m.correct, m.metric, m.error, m.score_detail = self._score_tuple(self._cli_score(wt))
         finally:
             with self._git_lock:
                 gates.git(["worktree", "remove", "--force", str(wt)], self.wd)
@@ -786,16 +723,51 @@ class Orchestrator:
         raised as well as lowered mid-run."""
         return max(1, min(self._parallelism(), MAX_PARALLELISM))
 
+    def _ev_max_candidates(self) -> int:
+        """Live candidate budget (0 = unbounded).
+
+        Every consumer must read the budget through here. The stop condition and
+        the explore/exploit schedule previously disagreed -- one read the live
+        value, the other ``cfg.max_candidates`` -- so raising -m in the web UI
+        extended the run but left the schedule pinned at its tail value.
+        """
+        return self.control.max_candidates() if self.control else self.cfg.max_candidates
+
     def _ev_want_more(self, rc: RunContext) -> bool:
         """True while neither the candidate budget, wall-clock, nor stop flag is hit."""
         if self.control and self.control.stop_requested():
             return False
-        maxc = self.control.max_candidates() if self.control else self.cfg.max_candidates
+        maxc = self._ev_max_candidates()
         if maxc and rc.dispatched >= maxc:
             return False
         limit = self._ev_wall_limit()
         assert rc.search_start is not None  # set before dispatch loop begins
         return not (limit and time.time() - rc.search_start >= limit)
+
+    def _auto_explore_frac(self, rc: RunContext) -> float:
+        """Annealed explore fraction: broad early (0.8), greedy late (0.2).
+
+        Progress is measured against whichever budget is actually in force, using
+        the same live values ``_ev_want_more`` stops on. With both a candidate cap
+        and a wall clock, the one nearer exhaustion drives the schedule -- matching
+        the whichever-comes-first stop, so the anneal always finishes just as the
+        run does. A wall-clock-only run (``-m 0 -w 8h``) therefore anneals on time
+        rather than sitting at a flat 0.5 for its whole life. With neither budget
+        set there is nothing to anneal against, so hold the midpoint.
+        """
+        maxc = self._ev_max_candidates()
+        limit = self._ev_wall_limit()
+        progress = 0.0
+        bounded = False
+        if maxc:
+            progress = max(progress, rc.dispatched / maxc)
+            bounded = True
+        if limit and rc.search_start is not None:
+            progress = max(progress, (time.time() - rc.search_start) / limit)
+            bounded = True
+        if not bounded:
+            return 0.5
+        return 0.8 - 0.6 * min(1.0, progress)
 
     def _ev_dispatch(
         self,
@@ -816,11 +788,8 @@ class Orchestrator:
         have_elites = bool(pop.elites())
         if self.control and not self.control.explore_auto():
             explore_frac = self.control.explore_bias() / 100.0
-        elif cfg.max_candidates:
-            progress = min(1.0, rc.dispatched / max(cfg.max_candidates, 1))
-            explore_frac = 0.8 - 0.6 * progress
         else:
-            explore_frac = 0.5
+            explore_frac = self._auto_explore_frac(rc)
         op = evolve.choose_operator(
             rng,
             {evolve.OP_EXPLORE: explore_frac, evolve.OP_EXPLOIT: 1.0 - explore_frac},
@@ -840,10 +809,8 @@ class Orchestrator:
             parent_commit=(parent.commit if parent else None),
             prompt=prompt,
         )
-        gpu = self._pick_gpu()
-        self._gpu_in_flight[gpu] += 1
-        fut = ex.submit(self._evolve_task, task, base, wt_root, dirs, gpu)
-        rc.futures[fut] = (task, gpu)
+        fut = ex.submit(self._evolve_task, task, base, wt_root, dirs)
+        rc.futures[fut] = task
         if parent is not None:
             rc.in_flight[parent.id] = rc.in_flight.get(parent.id, 0) + 1
             parent.children += 1
@@ -854,7 +821,6 @@ class Orchestrator:
             op=op,
             parent=(parent.id if parent else None),
             parent_metric=(parent.metric if parent else None),
-            gpu=gpu,
             in_flight=len(rc.futures),
             dispatched=rc.dispatched,
             # Selection context at dispatch time -- why the search made this
@@ -864,7 +830,7 @@ class Orchestrator:
             elites=len(pop.elites()),
         )
         ptxt = f" <- mem {parent.id}" if parent else ""
-        self._log(f"dispatch mem {mid}: {op}{ptxt} -> GPU {gpu}  (in-flight {len(rc.futures)})")
+        self._log(f"dispatch mem {mid}: {op}{ptxt}  (in-flight {len(rc.futures)})")
 
     def _ev_collect(
         self,
@@ -876,8 +842,7 @@ class Orchestrator:
         fut: Any,
     ) -> None:
         """Absorb one completed future into the population (the run loop refills)."""
-        task, gpu = rc.futures.pop(fut)
-        self._gpu_in_flight[gpu] = max(0, self._gpu_in_flight.get(gpu, 1) - 1)
+        task = rc.futures.pop(fut)
         if task.parent_id is not None:
             rc.in_flight[task.parent_id] = max(0, rc.in_flight.get(task.parent_id, 1) - 1)
         try:
@@ -919,14 +884,13 @@ class Orchestrator:
         """Steady-state asynchronous evolutionary search (see kernelthing/evolve.py).
 
         Keeps up to ``-j``/parallelism agents editing at once (live-tunable both
-        ways via the web UI, along with -k/-m/-w); all GPU work is serialized by
-        the per-device flock. Dispatches explore/exploit tasks against a durable
+        ways via the web UI, along with -k/-m/-w); scoring is a remote submission
+        per candidate. Dispatches explore/exploit tasks against a durable
         population until the budget is spent or a stop is requested, then
         promotes the best kernel to HEAD.
         """
         try:
-            with self._hardware_locked():
-                return self._run()
+            return self._run()
         finally:
             if self.journal is not None:
                 self.journal.close()

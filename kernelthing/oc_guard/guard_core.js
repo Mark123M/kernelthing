@@ -321,18 +321,27 @@ function checkBash(cfg, command) {
   if (/\.humanize\b/.test(c) && commandModifiesFile(c, "plan\\.md")) {
     return block(cfg, "plan-backup-protected", {}, "The plan.md backup in the loop directory cannot be modified.");
   }
-  // GPU allocation is mediated by the libktgpu.so LD_PRELOAD shim: on first CUDA
-  // use, a shimmed process flocks a free card and pins CUDA_VISIBLE_DEVICES to it.
-  // Agents must not touch that machinery. There is no legitimate reason for an
-  // agent command to reference these names, so mentioning any of them is blocked:
-  //   - CUDA_VISIBLE_DEVICES: setting/unsetting would pick a card without a lock
-  //   - LD_PRELOAD: unsetting would evade the shim entirely
-  //   - KERNELTHING_GPU_POOL / KERNELTHING_GUARD: the shim/guard's own config
-  //   - libktgpu / oc_guard / guard_core: reading the mechanism's internals
+  // Env-tampering block. Scoring is remote, so there is no longer a local GPU-lock
+  // shim -- but these names stay off-limits as defensive hygiene: an agent has no
+  // legitimate reason to manipulate or inspect the CUDA/loader environment or the
+  // loop's/guard's own config, and probing them is a classic sandbox-evasion move.
+  //   - CUDA_VISIBLE_DEVICES / LD_PRELOAD: manipulating the CUDA/loader environment
+  //   - KERNELTHING_GPU_POOL / KERNELTHING_GUARD: the loop's / guard's own config
+  //   - libktgpu / oc_guard / guard_core: probing the guard mechanism's internals
   if (/\b(cuda_visible_devices|ld_preload|kernelthing_gpu_pool|kernelthing_guard|libktgpu|oc_guard|guard_core)\b/.test(c)) {
     return block(cfg, "gpu-tamper", {},
-      "GPU allocation is managed automatically. Do not set, unset, inspect, or reference " +
-      "CUDA_VISIBLE_DEVICES, LD_PRELOAD, KERNELTHING_* or the GPU-lock shim.");
+      "The GPU/CUDA and loader environment is off-limits. Do not set, unset, inspect, or " +
+      "reference CUDA_VISIBLE_DEVICES, LD_PRELOAD, or the KERNELTHING_* / guard internals.");
+  }
+  // Remotely-scored problems submit to a public competition service. Correctness,
+  // timing and profiling runs are the agent's to make freely, but a *ranked* submission
+  // publishes to a public board and draws on a rate-limit bucket separate from the
+  // others -- that stays a human decision. Matches `--mode leaderboard` / `--mode=...`
+  // only, so a `#!POPCORN leaderboard <name>` directive is untouched.
+  if (/\bpopcorn(-cli)?\b/.test(c) && /--mode[\s=]+leaderboard\b/.test(c)) {
+    return block(cfg, "popcorn-leaderboard", {},
+      "Ranked leaderboard submissions are blocked during the loop. Use --mode test, " +
+      "--mode benchmark, or --profile-brev.");
   }
   // A bare environment dump would leak the same machinery (a targeted `printenv
   // LD_PRELOAD` is already caught above; this catches `env` / `printenv` alone).

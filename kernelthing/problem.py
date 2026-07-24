@@ -124,23 +124,6 @@ def prepare_problem(problem: Problem, managed_root: Path) -> Problem:
     return load_problem(dest / "problem.json")
 
 
-def set_gpu_model(problem_dir: Path, model_name: str) -> None:
-    """Write *model_name* into the problem's ``problem.json`` under the ``gpu`` key.
-
-    The bootstrap process calls this after validation to lock the problem to the
-    GPU model it was authored on. The manifest is updated in-place; a subsequent
-    ``git commit`` will include it.
-    """
-    manifest = problem_dir / "problem.json"
-    if not manifest.is_file():
-        return
-    data = json.loads(manifest.read_text(encoding="utf-8"))
-    if data.get("gpu") == model_name:
-        return
-    data["gpu"] = model_name
-    manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-
-
 def rewrite_plan_for_worktree(dest: Path, problem: Problem) -> None:
     """Update the copied plan.md for standalone worktree context.
 

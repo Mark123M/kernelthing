@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import gpupool, sandbox
+from . import sandbox
 
 # The PreToolUse guard plugin and the block-message templates it renders.
 GUARD_PLUGIN = Path(__file__).resolve().parent / "oc_guard" / "guard.js"
@@ -84,21 +84,16 @@ def parse_ndjson(stdout: str) -> tuple[str, str | None, float, dict[str, Any], i
 
 def build_opencode_env(
     *,
-    gpu_pool: list[int],
     data_dir: Path | None = None,
     guard: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[Path]]:
     """Build the env dict and opencode state dirs shared by run/run_interactive.
 
-    GPU access is mediated by the ``libktgpu.so`` LD_PRELOAD shim: we set
-    ``KERNELTHING_GPU_POOL`` to the whole pool and inject the shim so the first
-    CUDA call in any agent-spawned process flocks a free card and pins
-    ``CUDA_VISIBLE_DEVICES`` to it. ``CUDA_VISIBLE_DEVICES=""`` stays as a
-    fail-closed backstop: a process that somehow evades the shim sees no GPU
-    rather than an unlocked one.
+    The agent inherits the parent environment verbatim (so the model API key and
+    the ``POPCORN_*`` config for remote submit/profile propagate). Scoring is
+    remote, so no GPU-lock shim is injected and no CUDA env is pinned.
     """
     env = dict(os.environ)
-    gpupool.apply_shim_env(env, gpu_pool)
 
     oc_config: dict[str, Any] = {"snapshot": False}
     if guard is not None:
@@ -127,12 +122,10 @@ def run_interactive(
     session: str | None = None,
     continue_last: bool = False,
     prompt: str | None = None,
-    gpu_pool: list[int] | tuple[int, ...] = (),
     writable: bool = True,
     sandboxed: bool = True,
     data_dir: Path | None = None,
     extra_writable: list[Path] | tuple[Path, ...] = (),
-    ncu: bool = True,
 ) -> int:
     """Launch opencode's interactive TUI attached to the terminal, return exit code.
 
@@ -156,7 +149,7 @@ def run_interactive(
     if prompt:
         inner += ["--prompt", prompt]
 
-    env, oc_state = build_opencode_env(gpu_pool=list(gpu_pool), data_dir=data_dir)
+    env, oc_state = build_opencode_env(data_dir=data_dir)
 
     argv = sandbox.wrap(
         inner,
@@ -164,8 +157,6 @@ def run_interactive(
         writable=writable,
         writable_extra=[*oc_state, *extra_writable],
         enabled=sandboxed and sandbox.available(),
-        ncu=ncu,
-        gpu_indices=list(gpu_pool),
     )
     return subprocess.run(argv, env=env).returncode
 
@@ -177,7 +168,6 @@ def run(
     model: str,
     session: str | None = None,
     timeout: int = 5400,
-    gpu_pool: list[int] | tuple[int, ...] = (),
     writable: bool = True,
     sandboxed: bool = True,
     log_path: Path | None = None,
@@ -185,7 +175,6 @@ def run(
     data_dir: Path | None = None,
     extra_writable: list[Path] | tuple[Path, ...] = (),
     guard: dict[str, Any] | None = None,
-    ncu: bool = True,
 ) -> OpencodeResult:
     """Run one opencode turn and return the parsed result.
 
@@ -234,9 +223,7 @@ def run(
     # snapshots are pure overhead. The repo's opencode.json (snapshot:false) can't
     # reach the agent -- it runs in the per-worktree problem repo and we override
     # config via OPENCODE_CONFIG_CONTENT here -- so set it inline.
-    env, oc_state = build_opencode_env(
-        gpu_pool=list(gpu_pool), data_dir=data_dir, guard=guard
-    )
+    env, oc_state = build_opencode_env(data_dir=data_dir, guard=guard)
 
     argv = sandbox.wrap(
         inner,
@@ -244,8 +231,6 @@ def run(
         writable=writable,
         writable_extra=[*oc_state, *extra_writable],
         enabled=sandboxed and sandbox.available(),
-        ncu=ncu,
-        gpu_indices=list(gpu_pool),
     )
 
     import tempfile

@@ -1,0 +1,5 @@
+# Nsight Compute captures downloaded by `popcorn submit --profile-brev`. Candidates
+# commit with `git add -A`, and these are large.
+profile/
+*.ncu-rep
+*.zip

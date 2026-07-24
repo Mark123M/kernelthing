@@ -1,0 +1,69 @@
+Geomean score (secret) on B200: 0.0019876696598447596 s
+Geomean score (public) on B200: 0.0019501559313196228 s
+
+{
+  "done": true,
+  "file_name": "cholesky_b1024n64_v0.py",
+  "job": {
+    "error": null,
+    "status": "succeeded"
+  },
+  "leaderboard": "cholesky",
+  "runs": [
+    {
+      "end_time": "2026-07-20T10:29:08.487582Z",
+      "mode": "benchmark",
+      "passed": true,
+      "runner": "B200",
+      "score": null,
+      "secret": true,
+      "start_time": "2026-07-20T10:27:39.680141Z"
+    },
+    {
+      "end_time": "2026-07-20T10:29:26.457334Z",
+      "mode": "leaderboard",
+      "passed": true,
+      "runner": "B200",
+      "score": 0.0019876696598447596,
+      "secret": true,
+      "start_time": "2026-07-20T10:29:08.490250Z"
+    },
+    {
+      "end_time": "2026-07-20T10:27:31.432940Z",
+      "mode": "test",
+      "passed": true,
+      "runner": "B200",
+      "score": null,
+      "secret": false,
+      "start_time": "2026-07-20T10:27:27.959870Z"
+    },
+    {
+      "end_time": "2026-07-20T10:28:22.825505Z",
+      "mode": "benchmark",
+      "passed": true,
+      "runner": "B200",
+      "score": null,
+      "secret": false,
+      "start_time": "2026-07-20T10:27:31.433166Z"
+    },
+    {
+      "end_time": "2026-07-20T10:28:35.370414Z",
+      "mode": "leaderboard",
+      "passed": true,
+      "runner": "B200",
+      "score": 0.0019501559313196228,
+      "secret": false,
+      "start_time": "2026-07-20T10:28:22.825848Z"
+    },
+    {
+      "end_time": "2026-07-20T10:27:39.678441Z",
+      "mode": "test",
+      "passed": true,
+      "runner": "B200",
+      "score": null,
+      "secret": true,
+      "start_time": "2026-07-20T10:27:31.525578Z"
+    }
+  ],
+  "submission_id": 889961
+}

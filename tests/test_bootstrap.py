@@ -91,9 +91,10 @@ def _fake_run(text, *, author=True, **author_kw):
 
 
 @pytest.fixture
-def no_runtime_validation(monkeypatch):
-    # No GPU in CI: stub bench.score to return a passing result.
-    monkeypatch.setattr(bootstrap.bench, "score", lambda problem, worktree, **kw: (True, 1.0, None, {}))
+def no_runtime_validation():
+    # validate_problem is structural-only now (grading is remote), so there is no
+    # runtime score to stub. Kept as a no-op so the test signatures stay stable.
+    return None
 
 
 # --- behavior ---

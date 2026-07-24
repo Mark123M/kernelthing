@@ -1,0 +1,72 @@
+❌ n: 32; cond: 2; seed: 53124; batch: 16
+> output is not lower triangular enough: relative_residual=0.807
+
+❌ n: 64; cond: 2; seed: 53125; batch: 16
+> output is not lower triangular enough: relative_residual=0.865
+
+❌ n: 128; cond: 2; seed: 3321; batch: 16
+> output is not lower triangular enough: relative_residual=0.884
+
+❌ n: 256; cond: 2; seed: 94010; batch: 8
+> output is not lower triangular enough: relative_residual=0.868
+
+❌ n: 512; cond: 2; seed: 32523; batch: 4
+> output is not lower triangular enough: relative_residual=0.905
+
+❌ n: 1024; cond: 2; seed: 4327; batch: 2
+> output is not lower triangular enough: relative_residual=0.927
+
+❌ n: 2048; cond: 2; seed: 224466; batch: 1
+> output is not lower triangular enough: relative_residual=0.937
+
+❌ n: 128; case: spectrum; cond: 5; seed: 1200; batch: 8
+> output is not lower triangular enough: relative_residual=0.82
+
+❌ n: 128; case: diagonal; cond: 5; seed: 1201; batch: 8
+> L @ L.T does not reconstruct A: relative_residual=0.25
+
+❌ n: 32; case: spectrum; cond: 5; seed: 1202; batch: 32
+> output is not lower triangular enough: relative_residual=0.897
+
+❌ n: 32; case: diagonal; cond: 5; seed: 1203; batch: 32
+> L @ L.T does not reconstruct A: relative_residual=0.249
+
+❌ n: 64; case: spectrum; cond: 5; seed: 1204; batch: 16
+> output is not lower triangular enough: relative_residual=0.897
+
+❌ n: 64; case: diagonal; cond: 5; seed: 1205; batch: 16
+> L @ L.T does not reconstruct A: relative_residual=0.25
+
+❌ n: 256; case: lowrank; cond: 4; seed: 32524; batch: 4
+> output is not lower triangular enough: relative_residual=0.92
+
+❌ n: 512; case: rowscale; cond: 4; seed: 32525; batch: 4
+> output is not lower triangular enough: relative_residual=0.241
+
+❌ n: 512; case: tridiagonal; cond: 1; seed: 32526; batch: 4
+> output is not lower triangular enough: relative_residual=0.0867
+
+❌ n: 1024; case: lowrank; cond: 4; seed: 4330; batch: 2
+> output is not lower triangular enough: relative_residual=0.913
+
+{
+  "done": true,
+  "file_name": "bad_submission.py",
+  "job": {
+    "error": null,
+    "status": "succeeded"
+  },
+  "leaderboard": "cholesky",
+  "runs": [
+    {
+      "end_time": "2026-07-24T00:46:06.787748Z",
+      "mode": "test",
+      "passed": false,
+      "runner": "B200",
+      "score": null,
+      "secret": false,
+      "start_time": "2026-07-24T00:46:01.888087Z"
+    }
+  ],
+  "submission_id": 900988
+}

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -60,31 +60,15 @@ class Config:
     min_niches: int = 4  # below this many strategy niches, bias to explore
     evolve_seed: int = 0  # RNG seed for operator/parent sampling
 
-    # --- GPU pool ---
-    # Pool of CUDA device indices the loop may use (--gpu 0 --gpu 1 / --gpu 0,1);
-    # tasks go to the least-busy device. Exclusivity is a per-device flock taken
-    # by the libktgpu.so shim (lockfiles named in kernelthing/gpupool.py), not
-    # in-process state, so agents and the bench never share a card -- even
-    # across separate kernelthing processes on the same GPU.
-    gpu_indices: list[int] = field(default_factory=lambda: [0])
-
-    # --- GPU hardware control (reproducible benchmarking) ---
-    # Set power limit (watts) before the seed baseline. Requires root.
-    # ``None`` = don't change.
-    power_limit: int | None = None
-    # Lock GPU core clock to ``(min_mhz, max_mhz)``. Requires root + idle GPU.
-    gpu_clock_lock: tuple[int, int] | None = None
-    # Lock GPU memory clock to ``(min_mhz, max_mhz)``. Requires root + idle GPU.
-    mem_clock_lock: tuple[int, int] | None = None
-
     # --- agent tools & sandboxing ---
     sandbox: bool = True
     # kernelguard: static cheat detection (timer monkeypatching, result/CUDA-graph
     # replay, shape hardcoding, ...). On by default; disqualifies cheaters.
     kernelguard: bool = True
     kernelguard_profile: str = "default"
-    # Vendored KDA skills injected into prompts; ncu also binds the GPU perf-counter
-    # capability nodes in the sandbox.
+    # ncu: offer the agent the Nsight Compute knowledge/skill for reading the remote
+    # ``popcorn ... --profile-brev`` reports. Profiling itself is remote; nothing is
+    # bound in the sandbox for it.
     ncu: bool = True
     wiki: bool = True
 

@@ -15,14 +15,12 @@ requires-python = ">=3.11"
 # not pip deps.
 dependencies = [
   "kernelguard",
-  "pygpubench @ git+https://github.com/apaz-cli/pygpubench",
-  "torch",
-  "numpy",
   "PyYAML>=6.0",
 ]
-# pygpubench (+ torch) is the DEFAULT scoring engine (kernelthing/bench.py
-# runs each kernel in pygpubench's adversarial, sandboxed subprocess).
-# ``--no-pygpubench`` bypasses it for command-scored problems.
+# Scoring is remote: kernels are graded on the hosted gpu-mode popcorn service
+# (see kernelthing/popcorn.py), so there is no local benchmark engine and no
+# torch/CUDA dependency. ``kernelthing score`` submits to popcorn and parses the
+# result; the loop never touches a local GPU.
 [project.urls]
 GitHub = "https://github.com/apaz-cli/kernelthing"
 
@@ -37,13 +35,10 @@ kernelthing = "kernelthing.cli:main"
 include = ["kernelthing*"]
 
 # The opencode PreToolUse guard plugin ships inside the package (loaded by
-# opencode as an external plugin; see kernelthing/opencode_client.py). The
-# GPU-lock shim (libktgpu.so) is compiled from native/ktgpu.c by setup.py's
-# build hook; both the source and the built object ship with the package.
+# opencode as an external plugin; see kernelthing/opencode_client.py).
 [tool.setuptools.package-data]
 kernelthing = [
   "oc_guard/*.js", "oc_guard/*.json", "webui/*.html", "webui/*.js",
-  "native/*.c", "libktgpu.so",
 ]
 
 [tool.pytest.ini_options]
@@ -51,6 +46,12 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
+# Trees that follow someone else's conventions, not ours, so that `ruff check .` stays a
+# meaningful gate on kernelthing's own code. Problem dirs hold competition submissions
+# (kernel code uses matrix-style names the N rules reject, and reformatting them would
+# diverge them from the source they were vendored from); popcorn-cli is a third-party
+# checkout kept for reference. mypy already excludes problems/ for the same reason.
+extend-exclude = ["problems/", "popcorn-cli/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "T20", "Q", "RUF", "SIM", "C4"]

@@ -1,0 +1,72 @@
+✅ n: 32; cond: 2; seed: 53124; batch: 16
+> scaled_reconstruction_residual=0.024; batch=16; n=32
+
+✅ n: 64; cond: 2; seed: 53125; batch: 16
+> scaled_reconstruction_residual=0.014; batch=16; n=64
+
+✅ n: 128; cond: 2; seed: 3321; batch: 16
+> scaled_reconstruction_residual=0.00688; batch=16; n=128
+
+✅ n: 256; cond: 2; seed: 94010; batch: 8
+> scaled_reconstruction_residual=0.00545; batch=8; n=256
+
+✅ n: 512; cond: 2; seed: 32523; batch: 4
+> scaled_reconstruction_residual=0.00347; batch=4; n=512
+
+✅ n: 1024; cond: 2; seed: 4327; batch: 2
+> scaled_reconstruction_residual=0.0024; batch=2; n=1024
+
+✅ n: 2048; cond: 2; seed: 224466; batch: 1
+> scaled_reconstruction_residual=0.000636; batch=1; n=2048
+
+✅ n: 128; case: spectrum; cond: 5; seed: 1200; batch: 8
+> scaled_reconstruction_residual=0.00756; batch=8; n=128
+
+✅ n: 128; case: diagonal; cond: 5; seed: 1201; batch: 8
+> scaled_reconstruction_residual=0.00391; batch=8; n=128
+
+✅ n: 32; case: spectrum; cond: 5; seed: 1202; batch: 32
+> scaled_reconstruction_residual=0.0216; batch=32; n=32
+
+✅ n: 32; case: diagonal; cond: 5; seed: 1203; batch: 32
+> scaled_reconstruction_residual=0.00781; batch=32; n=32
+
+✅ n: 64; case: spectrum; cond: 5; seed: 1204; batch: 16
+> scaled_reconstruction_residual=0.0127; batch=16; n=64
+
+✅ n: 64; case: diagonal; cond: 5; seed: 1205; batch: 16
+> scaled_reconstruction_residual=0.00781; batch=16; n=64
+
+✅ n: 256; case: lowrank; cond: 4; seed: 32524; batch: 4
+> scaled_reconstruction_residual=0.0063; batch=4; n=256
+
+✅ n: 512; case: rowscale; cond: 4; seed: 32525; batch: 4
+> scaled_reconstruction_residual=0.00139; batch=4; n=512
+
+✅ n: 512; case: tridiagonal; cond: 1; seed: 32526; batch: 4
+> scaled_reconstruction_residual=0.00152; batch=4; n=512
+
+✅ n: 1024; case: lowrank; cond: 4; seed: 4330; batch: 2
+> scaled_reconstruction_residual=0.00342; batch=2; n=1024
+
+{
+  "done": true,
+  "file_name": "submission.py",
+  "job": {
+    "error": null,
+    "status": "succeeded"
+  },
+  "leaderboard": "cholesky",
+  "runs": [
+    {
+      "end_time": "2026-07-24T00:45:35.337249Z",
+      "mode": "test",
+      "passed": true,
+      "runner": "B200",
+      "score": null,
+      "secret": false,
+      "start_time": "2026-07-24T00:45:24.844151Z"
+    }
+  ],
+  "submission_id": 900985
+}

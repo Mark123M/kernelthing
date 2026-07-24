@@ -12,8 +12,7 @@ Two modes mirror the loop's interactivity flags:
   ask interactively.
 * ``auto=False`` (default) drafts headlessly, then drops the operator into an
   interactive opencode session (resuming the same session) to refine/answer, with
-  an ``(e)dit / (a)pprove / (q)uit`` review loop -- the same shape as the loop's
-  pygpubench setup review.
+  an ``(e)dit / (a)pprove / (q)uit`` review loop.
 
 The result is always a *complete* problem dir, committed so the loop's worktrees
 branch from it; the orchestrator therefore does no further spec setup.
@@ -27,7 +26,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import bench, gates, gpupool, opencode_client, prompts
+from . import gates, opencode_client, prompts
 from .config import MARKER_COMPLETE, MARKER_SETUP_BLOCKED, Config
 from .problem import Problem, git_toplevel, load_problem
 from .state import new_timestamp
@@ -72,13 +71,13 @@ def protected_files(problem: Problem) -> set[str]:
     return {f"{m}.py" for m in mods if m}
 
 
-def validate_problem(target: Path, *, gpu_index: int = 0) -> tuple[bool, str | None, Problem | None]:
-    """Runtime validation: a loadable manifest whose shipped submission scores correct.
+def validate_problem(target: Path) -> tuple[bool, str | None, Problem | None]:
+    """Structural validation: a loadable manifest whose plan and edit_files exist and
+    whose edit_files don't overlap the protected adapter/spec files.
 
-    Fails open when pygpubench/torch are not installed (ok=True with a note) -- the
-    same philosophy as the loop's gates -- so bootstrap can run on a box without the
-    optional benchmark deps; the loop's own scoring surfaces a clear error later if
-    they are genuinely needed.
+    The shipped submission's *correctness* is not scored here. Grading is remote (the
+    hosted popcorn service), so a submission at authoring time would cost a real
+    remote run for no benefit -- the first ``kernelthing score`` scores it for real.
     """
     if not (target / "problem.json").is_file():
         return False, "no problem.json was authored", None
@@ -103,11 +102,6 @@ def validate_problem(target: Path, *, gpu_index: int = 0) -> tuple[bool, str | N
             f"{sorted(clash)} (only the kernel source is editable)",
             problem,
         )
-    # GPU access is serialized by the libktgpu.so shim inside pygpubench's
-    # isolated worker (see bench._gpu_env); no in-process lock needed.
-    correct, _metric, err, _detail = bench.score(problem, problem.repo_root, gpu_index=gpu_index)
-    if not correct:
-        return False, err or "shipped submission did not score correct", problem
     return True, None, problem
 
 
@@ -224,13 +218,11 @@ def interactive_bootstrap(target: Path, repo_root: Path, prompt: str, cfg: Confi
             model=cfg.model,
             prompt=prompt if first else None,
             continue_last=not first,
-            gpu_pool=cfg.gpu_indices,
             writable=True,
             sandboxed=cfg.sandbox,
-            ncu=cfg.ncu,
         )
         first = False
-        ok, note, _ = validate_problem(target, gpu_index=cfg.gpu_indices[0])
+        ok, note, _ = validate_problem(target)
         print_summary(target, ok, note)
         question = (
             "(a)pprove, (e)dit more, or (q)uit? [a/e/q] "
@@ -291,18 +283,16 @@ def bootstrap_problem(
             model=cfg.model,
             session=None,
             timeout=cfg.opencode_timeout,
-            gpu_pool=cfg.gpu_indices,
             writable=True,
             sandboxed=cfg.sandbox,
             log_path=target / "bootstrap-opencode.log",
-            ncu=cfg.ncu,
         )
         if gates.has_setup_blocked(res.text):
             raise RuntimeError(
                 "bootstrap: --auto-setup agent emitted SETUP_BLOCKED -- cannot "
                 "author the problem from the given objective:\n" + res.text.strip()[-2000:]
             )
-        ok, note, _ = validate_problem(target, gpu_index=cfg.gpu_indices[0])
+        ok, note, _ = validate_problem(target)
         if not ok:
             raise RuntimeError(f"bootstrap: --auto-setup validation failed: {note}")
         print("[bootstrap] problem validated; --auto-setup accepting", file=sys.stderr)
@@ -310,11 +300,6 @@ def bootstrap_problem(
         # Drop the operator straight into the opencode TUI, seeded with the bootstrap
         # prompt, to describe the objective and author the files conversationally.
         interactive_bootstrap(target, repo_root, prompt, cfg)
-
-    # Lock this problem to the GPU model it was authored on.
-    from .problem import set_gpu_model
-    set_gpu_model(target, gpupool.gpu_name(cfg.gpu_indices[0]))
-    print(f"[bootstrap] locked problem to GPU: {gpupool.gpu_name(cfg.gpu_indices[0])}", file=sys.stderr)
 
     commit_problem(target, repo_root)
     return target

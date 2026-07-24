@@ -96,10 +96,10 @@ tasks like benchmarking, and allows us to maintain idea diversity.
 - a **controller** owns the population/archive and a task queue;
 - a pool of **mutation workers** (many, concurrent) each take a parent + operator,
   edit in an isolated worktree, and submit the result;
-- **all GPU access is serialized** by a per-device lock — not just the
-  authoritative benchmark, but every agent's own build/run/profile too.
+- **scoring is a remote submission** to the popcorn service — correctness then
+  timing — so many candidates can be scored at once, bounded only by the service.
 
-Results flow back continuously, so the GPU is always fed and agents always working.
+Results flow back continuously, so workers are always busy and slots refill the instant a result lands.
 
 **Two operators**, with compute budget split across them:
 
@@ -113,29 +113,25 @@ Results flow back continuously, so the GPU is always fed and agents always worki
 and exploration targets empty niches so the search can't collapse onto one lineage.
 
 **The measured benchmark is the only thing that decides what is elite or gets promoted.** The run stops on a global budget (wall-clock / candidate count), not a
-round count. `-j` sets max concurrent agents; all GPU work stays serialized.
+round count. `-j` sets max concurrent agents.
 
-**Automatic GPU allocation.** Access to the GPU pool is mediated by a per-device
-`flock` keyed on the physical GPU **UUID** (not the CUDA index, which is relative to
-each process's `CUDA_VISIBLE_DEVICES`); lockfiles are named in `kernelthing/gpupool.py`.
-All locking happens transparently in an `LD_PRELOAD` shim (`kernelthing/native/ktgpu.c`
-→ `libktgpu.so`) injected into every spawned process — agents and the benchmark's
-worker alike: on the first CUDA call, the shim flocks a free card from the pool, pins
-`CUDA_VISIBLE_DEVICES` to it for that process's lifetime, and blocks only if every
-card is busy. Purely CPU commands
-never trigger it, so builds and analysis don't hold a GPU. There is no wrapper for the
-agent to remember and nothing to opt into — and the guard blocks any attempt to set
-`CUDA_VISIBLE_DEVICES`/`LD_PRELOAD` or otherwise touch the mechanism, so an agent can't
-grab an unlocked card. Nothing ever contends on a device, even across separate
-kernelthing processes. `--gpu N` (repeatable) sets the pool.
+**Remote scoring.** kernelthing does not run kernels locally: every attempt is submitted
+to the hosted gpu-mode [popcorn](https://gpu-mode.com) service and graded on real
+competition hardware (a B200), which is the only place the target number is
+authoritative. A score is a `--mode test` submission (correctness) followed by a
+`--mode benchmark` submission (timing) only if the test passed; the returned numbers
+feed the search unchanged. There is no local GPU, no CUDA/torch dependency, and no
+device to contend on — `-j` candidates edit and score concurrently, bounded only by the
+service's own rate limits. The guard blocks a *ranked* leaderboard submission so agents
+can measure freely but never publish; that stays a human decision.
 
 ## Sandboxing
 
 Every edit-capable agent runs under **bubblewrap**: filesystem read-only except the
-candidate's worktree, opencode's own state, and `/tmp`; GPU device nodes and the pool's
-lock files bound through; `CUDA_VISIBLE_DEVICES` empty by default (fail-closed) so a
-card is reachable only via the lock shim. Network stays up (the model API needs it);
-the filesystem is the confinement boundary. opencode's `--dangerously-skip-permissions`
+candidate's worktree, opencode's own state, and `/tmp`. No GPU device nodes are bound —
+kernels are compiled and benchmarked remotely on the popcorn service, never in the
+sandbox. Network stays up (the model API and the popcorn service need it); the
+filesystem is the confinement boundary. opencode's `--dangerously-skip-permissions`
 is only safe because of this.
 
 ## Kernel tooling (KernelWiki + ncu profiling)

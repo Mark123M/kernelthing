@@ -12,41 +12,13 @@ serves a web UI for watching progress and live-tuning N / the turn cap / stop.
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import sys
 from pathlib import Path
-from typing import Any
 
 from . import bootstrap
 from .config import Config
 from .orchestrator import Orchestrator
 from .problem import Problem, load_problem, prepare_problem
-
-
-def _check_gpu_model(problem: Problem, gpus: list[int]) -> str | None:
-    """Return an error message if any GPU doesn't match the problem's required model.
-
-    When ``problem.gpu`` is empty (pre-existing or hand-authored problems) this is
-    a no-op — no restriction.
-    """
-    if not problem.gpu:
-        return None
-    from . import gpupool
-
-    bad: list[str] = []
-    for idx in gpus:
-        name = gpupool.gpu_name(idx)
-        if name != problem.gpu:
-            bad.append(f"  GPU {idx}: {name}")
-    if not bad:
-        return None
-    return (
-        f"\nProblem '{problem.name}' requires GPU model: {problem.gpu}\n"
-        "but the following GPU(s) don't match:\n" + "\n".join(bad) + "\n\n"
-        "Use --gpu to pick matching GPUs, or remove the 'gpu' field from\n"
-        "the problem's problem.json if this restriction is wrong.\n"
-    )
 
 BANNER_ART = r"""
  __                                          ___     __      __
@@ -98,26 +70,6 @@ def duration(text: str) -> int:
         ) from err
 
 
-def default_gpu() -> list[int]:
-    """Seed ``--gpu`` from ``CUDA_VISIBLE_DEVICES``.
-
-    A bare ``CUDA_VISIBLE_DEVICES=1 kernelthing ...`` is the natural way to pick a
-    GPU, but the env var alone is ignored: kernelthing *overrides*
-    CUDA_VISIBLE_DEVICES on every subprocess from the configured GPU indices. So
-    honour it here as the default for ``--gpu`` (an explicit ``--gpu`` still wins).
-    Accepts a comma-separated list too (``CUDA_VISIBLE_DEVICES=0,1``).
-    """
-    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    if not raw:
-        return [0]
-    indices: list[int] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if part.isdigit():
-            indices.append(int(part))
-    return indices or [0]
-
-
 def read_objective(args: argparse.Namespace) -> str | None:
     """The bootstrap objective: ``--objective-file`` wins, else a non-path positional."""
     if args.objective_file:
@@ -153,14 +105,9 @@ def resolve_problem(args: argparse.Namespace, cfg: Config) -> Problem:
 
 
 def run_loop(args: argparse.Namespace) -> int:
-    gpus: list[int] = args.gpu if args.gpu else default_gpu()
-
-    from . import gpucontrol
-
     cfg = Config(
         model=args.model,
         opencode_timeout=args.timeout,
-        gpu_indices=gpus,
         methodology=args.methodology,
         sandbox=not args.no_sandbox,
         parallelism=args.parallelism,
@@ -173,38 +120,13 @@ def run_loop(args: argparse.Namespace) -> int:
         elite_k=args.elite_k,
         min_niches=args.min_niches,
         problem_root=args.problem_root,
-        power_limit=args.power_limit,
-        gpu_clock_lock=gpucontrol.parse_mhz_pair(args.lock_clocks),
-        mem_clock_lock=gpucontrol.parse_mhz_pair(args.lock_mem),
     )
-
-    from . import gpupool
-
-    gpupool.warm_cache(gpus)
-
-    busy_warning = gpupool.check_busy_gpus(gpus)
-    if busy_warning:
-        print(f"[kernelthing] {busy_warning}", file=sys.stderr)
-
-    if not args.override_gpu:
-        arch_warning = gpupool.check_architecture_mismatch(gpus)
-        if arch_warning:
-            print(arch_warning, file=sys.stderr)
-            ans = input("[kernelthing] Proceed anyway? [y/N] ").strip().lower()
-            if ans not in ("y", "yes"):
-                return 1
 
     try:
         problem = resolve_problem(args, cfg)
     except (FileNotFoundError, RuntimeError, KeyError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-
-    if not args.override_gpu:
-        gpu_err = _check_gpu_model(problem, gpus)
-        if gpu_err:
-            print(gpu_err, file=sys.stderr)
-            return 2
 
     if not args.no_web:
         from . import webui
@@ -223,12 +145,10 @@ def run_loop(args: argparse.Namespace) -> int:
 
     wall_str = format_duration(args.wall_clock) if args.wall_clock else "none"
     budget_str = f"{args.max_candidates} candidates" if args.max_candidates else "unbounded"
-    gpu_str = f"{len(gpus)} GPU{'s' if len(gpus) > 1 else ''} ({', '.join(map(str, gpus))})"
     print(
         f"[kernelthing] agents:    {args.parallelism}  wall: {wall_str}  budget: {budget_str}",
         file=sys.stderr,
     )
-    print(f"[kernelthing] gpus:      {gpu_str}", file=sys.stderr)
 
     orch = Orchestrator(problem, cfg)
     try:
@@ -246,21 +166,18 @@ def score_command(argv: list[str]) -> int:
     """``kernelthing score [<dir>]``: run the authoritative scorer on a problem dir
     and print its JSON verdict.
 
-    This is the *same* ``bench.score`` call that gates bootstrap
-    (``validate_problem``) and every loop round -- so a green here means the
-    problem (or a kernel edit) scores correct for real.
+    This is the *same* call every loop round scores with -- so a green here means
+    the problem (or a kernel edit) scores correct for real.
 
-    ``--gpu N`` (repeatable) picks the GPU; without it, any free GPU of the same
-    model as the default device (``CUDA_VISIBLE_DEVICES``/GPU 0) is used, falling
-    back to a blocking lock on GPU 0 if all are busy.
+    Grading is remote: a ``bench.backend == "popcorn"`` problem is submitted to the
+    hosted popcorn service and the returned numbers are parsed (see popcorn.py).
+    There is no local GPU step, and no other backend is supported.
     """
-    from . import bench, gpupool
-
     p = argparse.ArgumentParser(
         prog="kernelthing score",
-        description="Score a problem dir with the authoritative pygpubench benchmark "
-        "and print {correct, metric, unit}. Same code path the loop scores "
-        "with -- use it to check a freshly authored problem or a kernel edit.",
+        description="Score a problem dir on the hosted popcorn service and print "
+        "{correct, metric, unit}. Same code path the loop scores with -- use it to "
+        "check a freshly authored problem or a kernel edit.",
     )
     p.add_argument(
         "dir",
@@ -269,22 +186,12 @@ def score_command(argv: list[str]) -> int:
         help="problem dir containing problem.json (default: current dir)",
     )
     p.add_argument(
-        "--gpu",
-        type=int,
-        action="append",
-        help="CUDA device index to score on (may be repeated). Without it the "
-        "scorer picks any free GPU of the same model as the default device.",
-    )
-    p.add_argument(
-        "--override-gpu",
+        "--test-only",
         action="store_true",
-        help=argparse.SUPPRESS,
         default=False,
+        help="check correctness only, skipping the timing run: the cheap pre-check "
+        "(one popcorn submission instead of two). Prints no metric.",
     )
-    # Orchestrator-internal (used by Orchestrator._cli_score); hidden from agents,
-    # who only ever run bare `kernelthing score .`.
-    p.add_argument("--baseline-median", type=float, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--emit-baseline", action="store_true", default=False, help=argparse.SUPPRESS)
     args = p.parse_args(argv)
 
     try:
@@ -293,49 +200,20 @@ def score_command(argv: list[str]) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    if not args.override_gpu and args.gpu:
-        gpu_err = _check_gpu_model(problem, args.gpu)
-        if gpu_err:
-            print(gpu_err, file=sys.stderr)
-            return 2
+    # Grading is remote. A popcorn-backed problem routes to the hosted service;
+    # nothing here ever touches a local GPU.
+    if (problem.bench or {}).get("backend") == "popcorn":
+        from . import popcorn
 
-    if args.gpu:
-        pool = gpupool.candidate_gpus(preferred=args.gpu)
-    elif problem.gpu:
-        pool = gpupool.candidate_gpus(model=problem.gpu)
-    else:
-        default_index = default_gpu()[0]
-        pool = gpupool.candidate_gpus(
-            model=gpupool.gpu_name(default_index),
-            arch=gpupool.gpu_architecture(default_index),
-        )
-    # Compile the kernel off-lock first (pure host-side nvcc, no GPU): the shimmed
-    # pygpubench worker then reuses the cached .so instead of compiling while
-    # holding the card, so the lock covers only the actual run.
-    bench.warm_build(problem, problem.repo_root, arch=gpupool.torch_arch_list(pool))
+        return popcorn.score_command(problem, args)
 
-    # Baseline denominator for pct_baseline/speedup: pin the one passed in, or (with
-    # --emit-baseline) measure it once here and report it so the caller can pin it
-    # on subsequent scores. Both run sequentially in this single process, so there
-    # is no shared-state race -- unlike scoring concurrently in threads.
-    result: dict[str, Any] = {"unit": problem.unit}
-    baseline_median = args.baseline_median
-    if args.emit_baseline and baseline_median is None:
-        baseline_median, berr = bench.measure_baseline(problem, problem.repo_root, gpu_pool=pool)
-        result["baseline_median"] = baseline_median
-        if berr:
-            print(json.dumps({**result, "correct": False, "metric": None, "error": berr}))
-            return 1
-    # GPU access is serialized inside bench.score: it hands pygpubench's isolated
-    # worker the libktgpu.so LD_PRELOAD shim together with this candidate pool. The
-    # shim probes the pool for a free card and flocks it for the worker's lifetime.
-    # No in-process flock here -- taking one would deadlock against the shim's.
-    correct, metric, err, detail = bench.score(
-        problem, problem.repo_root, gpu_pool=pool, baseline_median=baseline_median
+    print(
+        f"error: problem '{problem.name}' has no popcorn backend "
+        "(bench.backend != 'popcorn'). Local benchmarking was removed; every "
+        "problem must be graded on the hosted popcorn service.",
+        file=sys.stderr,
     )
-    result.update({"correct": correct, "metric": metric, "error": err, "bench": detail})
-    print(json.dumps(result))
-    return 0 if correct else 1
+    return 2
 
 
 def web_command(argv: list[str]) -> int:
@@ -412,8 +290,8 @@ def main(argv: list[str] | None = None) -> int:
         "--parallelism",
         type=int,
         default=4,
-        help="max agents editing at once (live-tunable up and down in the web "
-        "UI; the GPU benchmark stays serial). Default 4.",
+        help="max agents editing and scoring at once (live-tunable up and down "
+        "in the web UI); each score is a remote popcorn submission. Default 4.",
     )
     search.add_argument(
         "-k",
@@ -487,8 +365,8 @@ def main(argv: list[str] | None = None) -> int:
     tools.add_argument(
         "--no-ncu",
         action="store_true",
-        help="don't offer the agent the Nsight Compute (ncu) profiling skill, "
-        "and don't bind the GPU perf-counter nodes in the sandbox",
+        help="don't offer the agent the Nsight Compute (ncu) skill for reading "
+        "the remote popcorn --profile-brev reports",
     )
     tools.add_argument(
         "--no-wiki",
@@ -504,37 +382,6 @@ def main(argv: list[str] | None = None) -> int:
 
     runtime = parser.add_argument_group("runtime & output")
     runtime.add_argument(
-        "--gpu",
-        type=int,
-        action="append",
-        help="CUDA device index to pin (may be given multiple times, e.g. "
-        "--gpu 0 --gpu 1). Defaults to $CUDA_VISIBLE_DEVICES "
-        "when set, else [0].",
-    )
-    runtime.add_argument(
-        "--power-limit",
-        type=int,
-        default=None,
-        metavar="WATTS",
-        help="set GPU power limit before the seed baseline (requires root)",
-    )
-    runtime.add_argument(
-        "--lock-clocks",
-        type=str,
-        default=None,
-        metavar="MIN,MAX",
-        help="lock GPU core clock to a fixed range in MHz (e.g. '1500,1500'). "
-        "Requires root + idle GPU; applied before baseline, reset at exit.",
-    )
-    runtime.add_argument(
-        "--lock-mem",
-        type=str,
-        default=None,
-        metavar="MIN,MAX",
-        help="lock GPU memory clock to a fixed range in MHz. "
-        "Requires root + idle GPU; applied before baseline, reset at exit.",
-    )
-    runtime.add_argument(
         "--problem-root",
         type=Path,
         default=Path.home() / ".cache" / "kernelthing",
@@ -545,12 +392,6 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="at loop exit, run a retrospective that writes a sanitized "
         "methodology report (methodology-analysis-report.md) to the loop dir",
-    )
-    runtime.add_argument(
-        "--override-gpu",
-        action="store_true",
-        help=argparse.SUPPRESS,
-        default=False,
     )
 
     args = parser.parse_args(argv)

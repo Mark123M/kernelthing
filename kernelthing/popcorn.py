@@ -1,0 +1,987 @@
+"""Popcorn (gpu-mode) remote scorer -- the only benchmark backend.
+
+Kernels cannot be scored on the box the loop runs on. The gpu-mode competitions grade on
+hardware (B200) reachable only through the hosted popcorn service, so no local measurement
+is authoritative -- a laptop RTX card tells you nothing about the ranking. A problem sets
+``bench.backend = "popcorn"`` in ``problem.json`` and ``kernelthing score`` routes here;
+there is no local benchmark engine.
+
+The backend is deliberately confined to this module. ``cli.score_command`` routes here
+right after ``load_problem``, and the verdict printed is the
+``{correct, metric, error, unit, bench}`` JSON line ``Orchestrator._cli_score`` parses --
+so the search, the journal, the run dir and the web UI never learn how a number was
+produced. Nothing local ever opens libcuda on this path.
+
+Scoring is two remote submissions, in order:
+
+  1. ``popcorn submit --mode test``      -- correctness over the public test shapes.
+  2. ``popcorn submit --mode benchmark`` -- timings; only reached if (1) passed.
+
+Splitting them is what makes a broken kernel cheap: ``test`` runs small shapes and
+returns fast, so most failures never pay for a benchmark. ``benchmark`` re-checks every
+shape anyway (``run_benchmarking`` passes ``recheck=True``), so a kernel that only breaks
+at benchmark scale is still caught -- ``correct`` is the conjunction of both.
+
+**Numbers come from the API, not from the CLI's printed text.** The CLI formats results for
+humans -- ``⏱ 75.1 ± 0.07 µs`` -- keeping three significant figures, and that formatted row
+is the only thing ``--output`` writes. But the service keeps the real measurement and the
+CLI already fetches it: ``GET /user/submissions/<id>`` (header ``X-Popcorn-Cli-Id``) returns
+``runs[].result``, a flat dict of ``benchmark.N.{spec,mean,err,best,worst,std,runs}`` in
+nanoseconds, plus ``benchmark-count`` and an authoritative ``check``. ``get_user_submission``
+in the CLI parses that dict and then drops it on the floor while formatting. So: submit with
+the CLI (it owns auth, upload and polling), then make one authenticated GET for the id it
+reports.
+
+Concretely that is ``75141.44521620538`` ns rather than ``75.1 µs``, and ``benchmark-count``
+makes a shape-index mix-up impossible instead of merely detectable.
+
+``parse_benchmark_output`` / ``parse_test_output`` scrape the formatted text and survive as a
+**fallback** for when the API is unreachable (they are validated against 111 real captures).
+Falling back keeps a run going at ~0.5% worst-case quantisation instead of failing outright;
+``bench.source`` in the verdict records which channel produced the number, so a silent
+downgrade is visible afterwards.
+
+Repeat submissions are cached on the submission file's sha256 (see ``_cache_path``). This
+is not a micro-optimisation: an agent self-tests with ``kernelthing score .`` and the
+orchestrator then scores the commit it produced, which is usually the identical file, so
+the cache roughly halves the remote traffic of a run. Cached scores keep a benchmark's
+noise frozen rather than re-rolling it -- ``bench.cached`` records when that happened.
+"""
+
+from __future__ import annotations
+
+import ast
+import contextlib
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .problem import Problem
+
+# Wall-clock caps, split because the two runs are wildly different sizes. Measured on the
+# live cholesky board: `test` took 11s, `benchmark` 275s across 15 shapes. The server caps
+# a benchmark shape at 180s, so a pathologically slow kernel can push the timing run
+# towards 2700s -- hence the generous default, which mostly exists so such a kernel fails
+# as "too slow" rather than hanging.
+#
+# Both must fit inside Orchestrator._cli_score's 1800s kill of the whole `kernelthing
+# score` process: 300 + 1200 = 1500 leaves margin. Raise DEFAULT_TIMEOUT_S past 1500 and
+# the orchestrator starts killing scores mid-poll, losing the submission's result. The
+# popcorn CLI's own poll timeout is an hour, so ours is always the binding one.
+TEST_TIMEOUT_S = 300
+DEFAULT_TIMEOUT_S = 1200
+
+# Hosted Nsight Compute endpoint the CLI's --profile-brev talks to (popcorn-cli
+# docs/profiling.md). Only used to fill in the agent's prompt; the CLI reads it from the
+# environment, and an operator export of either name wins over this default.
+DEFAULT_BREV_PROFILER_URL = "https://http--brev-profiler-proxy--dxfjds728w5v.code.run"
+
+# Service API. The CLI hardcodes this same default in main.rs when POPCORN_API_URL is
+# unset, and authenticates every request with the cli_id from ~/.popcorn.yaml.
+DEFAULT_API_URL = "https://site--bot--dxfjds728w5v.code.run"
+API_TIMEOUT_S = 30
+CLI_ID_HEADER = "X-Popcorn-Cli-Id"
+
+# Where the numbers came from, recorded in the verdict so a silent downgrade is visible.
+SOURCE_API = "api"
+SOURCE_TEXT = "cli-text"
+
+# Submission modes we drive. "profile" is the agent's business (--profile-brev), not the
+# scorer's.
+MODE_TEST = "test"
+MODE_BENCHMARK = "benchmark"
+MODE_LEADERBOARD = "leaderboard"
+
+# How the parsed per-shape timings become a single number.
+#   shape       -- one benchmark index's mean (the default; a per-shape specialisation
+#                  only moves its own entry, and a whole-board geomean would bury it)
+#   geomean     -- geometric mean over every shape, mirroring the official ranking
+#   leaderboard -- ask the server for the ranked geomean instead of timing locally
+METRIC_MODES = ("shape", "geomean", "leaderboard")
+
+# Value+unit as rendered by the CLI's format_time (ns / us / ms, auto-scaled by
+# magnitude). Both the micro sign and a Greek mu are accepted -- they render identically
+# and which one appears is not worth depending on.
+_NUM = r"[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
+_UNIT = r"(?:ns|µs|μs|us|ms)"
+TIME_RE = re.compile(rf"({_NUM})\s*({_UNIT})")
+# `<mean> ± <err> <unit>` or `<mean> <unit>`: format_time prints ONE unit, after the
+# error term, so the mean's scale has to be read off the end of the line.
+MEAN_ERR_RE = re.compile(rf"({_NUM})(?:\s*±\s*({_NUM}))?\s*({_UNIT})")
+_TO_US = {"ns": 1e-3, "µs": 1.0, "μs": 1.0, "us": 1.0, "ms": 1e3}
+
+# A benchmark/test spec line, matching the grammar the eval driver parses test cases
+# with: `key: value` parts joined by `;`. Anchoring on this is what lets the parsers tell
+# a spec apart from a line of a failure's free-form error text.
+_PART = r"[a-zA-Z_][a-zA-Z0-9_]*:\s*(?:[a-zA-Z_][a-zA-Z0-9_]*|[+-]?[0-9]+)"
+SPEC_RE = re.compile(rf"\s*{_PART}\s*(?:;\s*{_PART}\s*)*")
+# Two-field form. A single `Something: value` also matches SPEC_RE, and Python
+# exception lines ("RuntimeError: foo") do too -- so inside a failed shape's error body,
+# where such lines are expected, only the unambiguous multi-field form opens a new shape.
+SPEC_MULTI_RE = re.compile(rf"\s*{_PART}\s*(?:;\s*{_PART}\s*)+")
+
+# `❌ <spec> failed testing:` opens a failed benchmark row; the error body follows.
+BENCH_FAIL_RE = re.compile(r"^❌\s*(?P<spec>.*?)\s+failed testing:\s*$")
+# Test rows: `✅ <spec>` / `❌ <spec>` / `? <spec> (<status>)`.
+TEST_ROW_RE = re.compile(r"^(?P<mark>✅|❌|\?)\s+(?P<spec>.*?)\s*$")
+# `Geomean score (public) on B200: 0.0023 s` -- full precision, unlike the ⏱ rows.
+GEOMEAN_RE = re.compile(
+    r"Geomean score\s*\((?P<scope>public|secret)\)\s*on\s*(?P<runner>[^:]+):\s*"
+    rf"(?P<value>{_NUM})\s*s"
+)
+
+_STOPWATCH = "⏱"  # mean ± err
+_FAST = "⚡"  # best
+_SLOW = "\U0001f40c"  # worst
+
+
+class PopcornError(RuntimeError):
+    """A popcorn invocation could not be turned into a verdict."""
+
+
+@dataclass
+class PopcornConfig:
+    """Resolved ``problem.bench.popcorn`` block."""
+
+    leaderboard: str
+    gpu: str = "B200"
+    submission_file: str = "submission.py"
+    benchmark_index: int = 0
+    # Expected spec of benchmark_index, e.g. "n: 128; cond: 2; seed: 41128; batch: 256".
+    # Optional but strongly recommended: it is the only thing standing between a parser
+    # that drops a row and a run that silently optimises a different shape. Compared
+    # field-wise, so upstream reordering is not a false alarm.
+    benchmark_spec: str = ""
+    metric_mode: str = "shape"
+    timeout_s: int = DEFAULT_TIMEOUT_S
+    reject_substrings: list[str] = field(default_factory=list)
+    cache: bool = True
+    bin: str = ""
+
+    @property
+    def timing_mode(self) -> str:
+        """The submission mode that produces the metric."""
+        return MODE_LEADERBOARD if self.metric_mode == "leaderboard" else MODE_BENCHMARK
+
+    def timeout_for(self, mode: str) -> int:
+        """Wall-clock cap for one submission. The test run is ~25x cheaper than timing."""
+        return min(self.timeout_s, TEST_TIMEOUT_S) if mode == MODE_TEST else self.timeout_s
+
+
+@dataclass
+class Shape:
+    """One benchmark entry as the CLI rendered it."""
+
+    index: int
+    spec: str
+    status: str = "pass"
+    mean_us: float | None = None
+    err_us: float | None = None
+    best_us: float | None = None
+    worst_us: float | None = None
+    error: str = ""
+
+    def record(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"index": self.index, "spec": self.spec, "status": self.status}
+        for key in ("mean_us", "err_us", "best_us", "worst_us"):
+            value = getattr(self, key)
+            if value is not None:
+                d[key] = round(value, 4)
+        if self.error:
+            d["error"] = self.error[:1000]
+        return d
+
+
+@dataclass
+class TestReport:
+    """The ✅/❌ rows of a ``--mode test`` run."""
+
+    passed: int = 0
+    failed: int = 0
+    failures: list[dict[str, str]] = field(default_factory=list)
+
+    def record(self) -> dict[str, Any]:
+        return {"passed": self.passed, "failed": self.failed, "failures": self.failures}
+
+
+@dataclass
+class Submission:
+    """One completed ``popcorn submit`` invocation.
+
+    ``raw`` is the service's own result dict for the non-secret run of this mode, fetched
+    from the API. When it is present the numbers come from there; ``text`` is only parsed
+    when it is not.
+    """
+
+    mode: str
+    text: str
+    returncode: int
+    wall_s: float
+    cached: bool = False
+    raw: dict[str, Any] | None = None
+    score: float | None = None  # the run's own score field (ranked geomean, seconds)
+
+    @property
+    def submission_id(self) -> int | None:
+        summary = parse_summary_json(self.text)
+        sid = summary.get("submission_id")
+        return int(sid) if isinstance(sid, (int, float)) else None
+
+    @property
+    def source(self) -> str:
+        return SOURCE_API if self.raw else SOURCE_TEXT
+
+
+# --- configuration ----------------------------------------------------------
+
+
+def resolve_config(problem: Problem) -> PopcornConfig:
+    """Extract and validate the popcorn block from a problem manifest."""
+    raw = dict((problem.bench or {}).get("popcorn") or {})
+    leaderboard = str(raw.get("leaderboard", "")).strip()
+    if not leaderboard:
+        raise PopcornError("problem.bench.popcorn.leaderboard is required")
+    metric_mode = str(raw.get("metric_mode", "shape"))
+    if metric_mode not in METRIC_MODES:
+        raise PopcornError(
+            f"unknown metric_mode '{metric_mode}'; expected one of {', '.join(METRIC_MODES)}"
+        )
+    return PopcornConfig(
+        leaderboard=leaderboard,
+        gpu=str(raw.get("gpu", "B200")),
+        submission_file=str(raw.get("submission_file", "submission.py")),
+        benchmark_index=int(raw.get("benchmark_index", 0)),
+        benchmark_spec=str(raw.get("benchmark_spec", "")),
+        metric_mode=metric_mode,
+        timeout_s=int(raw.get("timeout_s", DEFAULT_TIMEOUT_S)),
+        reject_substrings=[str(s) for s in raw.get("reject_substrings", [])],
+        cache=bool(raw.get("cache", True)),
+        bin=str(raw.get("bin", "")),
+    )
+
+
+def config_or_none(problem: Problem) -> PopcornConfig | None:
+    """``resolve_config`` for callers that only want to know 'is this a popcorn problem'.
+
+    Returns ``None`` for a non-popcorn problem *and* for a malformed popcorn block --
+    prompt assembly must not raise, and a bad manifest surfaces properly at score time.
+    """
+    if (problem.bench or {}).get("backend") != "popcorn":
+        return None
+    try:
+        return resolve_config(problem)
+    except (PopcornError, TypeError, ValueError):
+        return None
+
+
+def popcorn_bin(cfg: PopcornConfig | None = None) -> str:
+    """Path to the popcorn CLI, or '' when it cannot be found.
+
+    ``bench.popcorn.bin`` wins (the problem declared it), then
+    ``KERNELTHING_POPCORN_BIN``, then PATH. The env override exists because the CLI
+    usually lives in ``~/.local/bin``, which a sandboxed agent's PATH may not carry.
+    """
+    if cfg and cfg.bin:
+        return cfg.bin
+    override = os.environ.get("KERNELTHING_POPCORN_BIN", "").strip()
+    if override:
+        return override
+    return shutil.which("popcorn") or shutil.which("popcorn-cli") or ""
+
+
+def api_base() -> str:
+    """Service base URL. Mirrors the CLI: env wins, else its own hardcoded default."""
+    return (os.environ.get("POPCORN_API_URL", "").strip() or DEFAULT_API_URL).rstrip("/")
+
+
+def cli_id() -> str:
+    """The client id the CLI authenticates with, or '' if not registered.
+
+    ``~/.popcorn.yaml`` holds a single ``cli_id: <uuid>`` key. Parsed by hand rather than
+    with PyYAML so fetching a result never depends on an optional import being present --
+    a missing id degrades to text scraping, it must not raise.
+    """
+    override = os.environ.get("POPCORN_CLI_ID", "").strip()
+    if override:
+        return override
+    try:
+        text = (Path.home() / ".popcorn.yaml").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    m = re.search(r"^\s*cli_id\s*:\s*[\"']?([^\"'\s]+)", text, re.MULTILINE)
+    return m.group(1) if m else ""
+
+
+def fetch_submission(submission_id: int, *, timeout: int = API_TIMEOUT_S) -> dict[str, Any]:
+    """``GET /user/submissions/<id>`` -- the full record, including ``runs[].result``.
+
+    Raises ``PopcornError`` on any failure; callers treat that as "fall back to text".
+    """
+    ident = cli_id()
+    if not ident:
+        raise PopcornError("no popcorn cli_id (run `popcorn register`)")
+    req = urllib.request.Request(
+        f"{api_base()}/user/submissions/{submission_id}",
+        headers={CLI_ID_HEADER: ident, "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
+        raise PopcornError(f"popcorn API fetch failed: {e}") from e
+    if not isinstance(payload, dict):
+        raise PopcornError("popcorn API returned a non-object")
+    return payload
+
+
+def select_run(payload: dict[str, Any], mode: str) -> dict[str, Any] | None:
+    """The public run for *mode*.
+
+    A ranked submission carries six runs -- test/benchmark/leaderboard x public/secret --
+    so both the mode and the secret flag have to be matched. The secret run is measured on
+    a different seed and is never the number to report.
+    """
+    for run in payload.get("runs") or []:
+        if not isinstance(run, dict):
+            continue
+        if str(run.get("mode", "")).lower() == mode.lower() and not run.get("secret"):
+            return run
+    return None
+
+
+def _num(value: Any) -> float | None:
+    """Result-dict values arrive as strings; anything unparseable is simply absent."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def shapes_from_result(result: dict[str, Any]) -> list[Shape]:
+    """Per-shape timings from the service's own result dict, in nanoseconds.
+
+    ``benchmark-count`` is authoritative, so a shape that failed (and therefore has no
+    timings) still occupies its index -- which is what makes positional selection safe
+    here in a way it can never be when scraping rows out of formatted text.
+    """
+    count = _num(result.get("benchmark-count"))
+    if count is None:
+        return []
+    shapes: list[Shape] = []
+    for i in range(int(count)):
+        base = f"benchmark.{i}"
+        status = str(result.get(f"{base}.status", "") or "")
+        mean_ns = _num(result.get(f"{base}.mean"))
+        shapes.append(
+            Shape(
+                index=i,
+                spec=str(result.get(f"{base}.spec", "") or ""),
+                status="fail" if status == "fail" or mean_ns is None else "pass",
+                mean_us=None if mean_ns is None else mean_ns / 1000.0,
+                err_us=(lambda v: None if v is None else v / 1000.0)(_num(result.get(f"{base}.err"))),
+                best_us=(lambda v: None if v is None else v / 1000.0)(_num(result.get(f"{base}.best"))),
+                worst_us=(lambda v: None if v is None else v / 1000.0)(
+                    _num(result.get(f"{base}.worst"))
+                ),
+                error=str(result.get(f"{base}.error", "") or ""),
+            )
+        )
+    return shapes
+
+
+def test_report_from_result(result: dict[str, Any]) -> TestReport:
+    """Test outcomes from the service's own result dict."""
+    count = _num(result.get("test-count"))
+    if count is None:
+        return TestReport()
+    report = TestReport()
+    for i in range(int(count)):
+        base = f"test.{i}"
+        if str(result.get(f"{base}.status", "") or "") == "fail":
+            report.failed += 1
+            report.failures.append(
+                {
+                    "spec": str(result.get(f"{base}.spec", "") or ""),
+                    "error": str(result.get(f"{base}.error", "") or ""),
+                }
+            )
+        else:
+            report.passed += 1
+    return report
+
+
+def brev_profiler_url() -> str:
+    """Hosted profiler endpoint: an operator's export wins, else the documented default."""
+    for name in ("POPCORN_BREV_PROFILER_URL", "BREV_PROFILER_URL"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return DEFAULT_BREV_PROFILER_URL
+
+
+# --- parsing ----------------------------------------------------------------
+
+
+def parse_time_us(text: str) -> float | None:
+    """Read the first ``<value> <unit>`` in *text* and return it in microseconds."""
+    m = TIME_RE.search(text)
+    if not m:
+        return None
+    try:
+        value = float(m.group(1))
+    except ValueError:
+        return None
+    return value * _TO_US[m.group(2)]
+
+
+def _is_spec(line: str, *, strict: bool = False) -> bool:
+    """Does *line* look like a benchmark/test spec? ``strict`` demands >1 field."""
+    text = line.strip()
+    pattern = SPEC_MULTI_RE if strict else SPEC_RE
+    return bool(text) and pattern.fullmatch(text) is not None
+
+
+def parse_mean_err_us(line: str) -> tuple[float | None, float | None]:
+    """Read a ``⏱ <mean> ± <err> <unit>`` line, returning both in microseconds."""
+    m = MEAN_ERR_RE.search(line)
+    if not m:
+        return None, None
+    try:
+        scale = _TO_US[m.group(3)]
+        mean = float(m.group(1)) * scale
+        err = float(m.group(2)) * scale if m.group(2) else None
+    except (ValueError, KeyError):
+        return None, None
+    return mean, err
+
+
+def split_summary(text: str) -> tuple[str, str]:
+    """Split a popcorn result into ``(rows_text, summary_json_text)``.
+
+    The CLI appends a pretty-printed JSON object after the formatted rows, so the
+    summary always starts at a line that is exactly ``{``. Later candidates are tried
+    first: a failure's error text may itself contain JSON.
+    """
+    lines = text.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].rstrip() != "{":
+            continue
+        candidate = "\n".join(lines[i:])
+        try:
+            json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        return "\n".join(lines[:i]), candidate
+    return text, ""
+
+
+def parse_summary_json(text: str) -> dict[str, Any]:
+    """The trailing summary object (submission_id, job status, runs), or ``{}``."""
+    _, summary = split_summary(text)
+    if not summary:
+        return {}
+    try:
+        parsed = json.loads(summary)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def parse_test_output(text: str) -> TestReport:
+    """Parse the ✅/❌ rows of a ``--mode test`` result.
+
+    A row's detail is introduced by ``> `` and runs until the next row, so failures keep
+    their whole (multi-line) message -- that text is the most useful thing the next agent
+    turn can be handed.
+    """
+    rows, _ = split_summary(text)
+    report = TestReport()
+    current: dict[str, str] | None = None
+    detail: list[str] = []
+
+    def flush() -> None:
+        nonlocal current, detail
+        if current is not None:
+            current["error"] = "\n".join(detail).strip()
+            report.failures.append(current)
+        current, detail = None, []
+
+    for line in rows.splitlines():
+        m = TEST_ROW_RE.match(line)
+        if m and _is_spec(m.group("spec")):
+            flush()
+            if m.group("mark") == "✅":
+                report.passed += 1
+            else:
+                report.failed += 1
+                current = {"spec": m.group("spec")}
+            continue
+        if current is None:
+            continue
+        stripped = line.lstrip()
+        detail.append(stripped[2:] if stripped.startswith("> ") else line)
+    flush()
+    return report
+
+
+def parse_benchmark_output(text: str) -> list[Shape]:
+    """Parse the per-shape rows of a ``--mode benchmark`` result, in index order.
+
+    Walks lines rather than splitting on blank lines: a failed shape's error body is
+    free-form and may contain blank lines of its own, which would fragment a chunk-based
+    split and silently drop later shapes.
+    """
+    rows, _ = split_summary(text)
+    shapes: list[Shape] = []
+    error_lines: list[str] = []
+
+    def collecting() -> bool:
+        return bool(shapes) and shapes[-1].status == "fail"
+
+    def flush_error() -> None:
+        nonlocal error_lines
+        if shapes and error_lines:
+            shapes[-1].error = "\n".join(error_lines).strip()
+        error_lines = []
+
+    for line in rows.splitlines():
+        fail = BENCH_FAIL_RE.match(line.strip())
+        if fail:
+            flush_error()
+            shapes.append(Shape(index=len(shapes), spec=fail.group("spec"), status="fail"))
+            continue
+        # While inside a failure's error body, demand the unambiguous multi-field spec
+        # form: an exception line would otherwise open a phantom shape and shift every
+        # later index -- which silently repoints the metric at the wrong benchmark.
+        if _is_spec(line, strict=collecting()):
+            flush_error()
+            shapes.append(Shape(index=len(shapes), spec=line.strip()))
+            continue
+        if not shapes:
+            continue
+        if _STOPWATCH in line:
+            shapes[-1].mean_us, shapes[-1].err_us = parse_mean_err_us(line)
+            continue
+        if _FAST in line or _SLOW in line:
+            head, _, tail = line.partition(_SLOW)
+            shapes[-1].best_us = parse_time_us(head)
+            shapes[-1].worst_us = parse_time_us(tail) if tail else None
+            continue
+        if collecting():
+            error_lines.append(line)
+    flush_error()
+    return shapes
+
+
+def parse_leaderboard_score_s(text: str) -> float | None:
+    """The public ranked geomean in seconds, or ``None``.
+
+    Match on *scope*, never on position. The CLI prints one line per scored run in
+    ``details.runs`` order, which the server does not stabilise: across 54 real captures
+    26 printed the secret line first. A parser that took the first ``Geomean score`` line
+    would therefore report the secret score -- measured on a different seed, and not what
+    the public board ranks on -- roughly half the time, with nothing to flag it.
+    """
+    for m in GEOMEAN_RE.finditer(text):
+        if m.group("scope") == "public":
+            try:
+                return float(m.group("value"))
+            except ValueError:
+                return None
+    return None
+
+
+def spec_fields(spec: str) -> dict[str, str]:
+    """Split a ``key: value; key: value`` spec into a dict.
+
+    Comparison is field-wise rather than string-wise because the service does not emit a
+    consistent field order -- the benchmark rows print ``n; cond; seed; batch`` while the
+    profiler's artifact slug uses ``batch-n-cond-seed``.
+    """
+    fields: dict[str, str] = {}
+    for part in spec.split(";"):
+        key, sep, value = part.partition(":")
+        if sep:
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+def geomean_us(shapes: list[Shape]) -> float | None:
+    """Geometric mean of every timed shape, in microseconds."""
+    values = [s.mean_us for s in shapes if s.mean_us and s.mean_us > 0]
+    if not values:
+        return None
+    return math.exp(sum(math.log(v) for v in values) / len(values))
+
+
+# --- submission cache -------------------------------------------------------
+
+
+def _cache_root() -> Path:
+    override = os.environ.get("KERNELTHING_POPCORN_CACHE", "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".cache" / "kernelthing" / "popcorn-cache"
+
+
+def _cache_path(cfg: PopcornConfig, digest: str, mode: str) -> Path:
+    return _cache_root() / cfg.leaderboard / cfg.gpu / mode / f"{digest}.json"
+
+
+def _cache_load(cfg: PopcornConfig, digest: str, mode: str) -> Submission | None:
+    if not cfg.cache:
+        return None
+    path = _cache_path(cfg, digest, mode)
+    try:
+        d = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    raw = d.get("raw")
+    return Submission(
+        mode=mode,
+        text=str(d.get("text", "")),
+        returncode=int(d.get("returncode", 0)),
+        wall_s=float(d.get("wall_s", 0.0)),
+        cached=True,
+        raw=raw if isinstance(raw, dict) else None,
+        score=_num(d.get("score")),
+    )
+
+
+def _cache_store(cfg: PopcornConfig, digest: str, sub: Submission) -> None:
+    if not cfg.cache:
+        return
+    path = _cache_path(cfg, digest, sub.mode)
+    payload = {
+        "text": sub.text,
+        "returncode": sub.returncode,
+        "wall_s": sub.wall_s,
+        "raw": sub.raw,
+        "score": sub.score,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass  # a cache that cannot be written must never fail a score
+
+
+# --- submitting -------------------------------------------------------------
+
+
+def submit(cfg: PopcornConfig, sub_path: Path, mode: str, digest: str) -> Submission:
+    """Run one ``popcorn submit`` and return its combined output.
+
+    Leaderboard/GPU/mode are passed as explicit flags so they override any ``#!POPCORN``
+    directives inside the submission file -- the agent edits that file, and the target it
+    is graded against is not the agent's to choose.
+
+    The CLI writes artifact files into its working directory, so it runs in a throwaway
+    temp dir; ``--output`` captures the result text, and stdout is used as the fallback
+    when the CLI exits before writing the file.
+    """
+    cached = _cache_load(cfg, digest, mode)
+    if cached is not None:
+        return cached
+    exe = popcorn_bin(cfg)
+    if not exe:
+        raise PopcornError("popcorn CLI not found on PATH (set bench.popcorn.bin)")
+
+    with tempfile.TemporaryDirectory(prefix="kt-popcorn-") as tmp:
+        out_file = Path(tmp) / "result.txt"
+        cmd = [
+            exe, "submit", str(sub_path.resolve()),
+            "--leaderboard", cfg.leaderboard,
+            "--gpu", cfg.gpu,
+            "--mode", mode,
+            "--no-tui",
+            "--output", str(out_file),
+        ]
+        budget = cfg.timeout_for(mode)
+        t0 = time.time()
+        try:
+            r = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True, timeout=budget)
+        except subprocess.TimeoutExpired as e:
+            raise PopcornError(f"popcorn --mode {mode} timed out after {budget}s") from e
+        wall = round(time.time() - t0, 1)
+        text = ""
+        with contextlib.suppress(OSError):
+            text = out_file.read_text(encoding="utf-8")
+        if not text.strip():
+            text = r.stdout or ""
+        if not text.strip():
+            raise PopcornError(
+                f"popcorn --mode {mode} produced no result "
+                f"(exit {r.returncode}): {(r.stderr or '').strip()[-500:]}"
+            )
+        sub = Submission(mode=mode, text=text, returncode=r.returncode, wall_s=wall)
+
+    _attach_raw(sub)
+    # Only memoise a submission the CLI completed. A nonzero exit means the job failed,
+    # timed out, or the network broke -- caching that would pin a transient error to this
+    # file's hash forever, so an unlucky blip would permanently mark a good kernel broken.
+    # A *correctness* failure still exits 0 and is cached on purpose: it is deterministic.
+    if r.returncode == 0:
+        _cache_store(cfg, digest, sub)
+    return sub
+
+
+def _attach_raw(sub: Submission) -> None:
+    """Best-effort upgrade from formatted text to the service's own numbers.
+
+    Never raises: an unreachable API degrades the run to text scraping rather than
+    failing it. ``Submission.source`` records which channel won.
+    """
+    sid = sub.submission_id
+    if sid is None:
+        return
+    try:
+        run = select_run(fetch_submission(sid), sub.mode)
+    except PopcornError:
+        return
+    if not run:
+        return
+    result = run.get("result")
+    if isinstance(result, dict):
+        sub.raw = result
+    sub.score = _num(run.get("score"))
+
+
+# --- scoring ----------------------------------------------------------------
+
+
+def _precheck(cfg: PopcornConfig, source: str) -> str | None:
+    """Local rejections that would otherwise cost a remote round-trip."""
+    try:
+        ast.parse(source)
+    except SyntaxError as e:
+        return f"submission does not parse: {e.msg} (line {e.lineno})"
+    for needle in cfg.reject_substrings:
+        if needle and needle in source:
+            return (
+                f"submission contains '{needle}', which the evaluation server rejects; "
+                "remove it (including inside comments and longer words)"
+            )
+    return None
+
+
+def _test_error(report: TestReport, total: int) -> str:
+    """A compact, actionable failure string built from the failing test rows."""
+    parts = [f"popcorn test: {report.failed}/{total} shapes failed"]
+    for f in report.failures[:3]:
+        detail = " ".join(f.get("error", "").split())[:400]
+        parts.append(f"  {f['spec']}: {detail}" if detail else f"  {f['spec']}")
+    if len(report.failures) > 3:
+        parts.append(f"  ... and {len(report.failures) - 3} more")
+    return "\n".join(parts)
+
+
+def _metric_from(
+    cfg: PopcornConfig, shapes: list[Shape], timing: Submission
+) -> tuple[float | None, str | None, dict[str, Any]]:
+    """Turn a parsed timing submission into ``(metric_us, err, extra_detail)``."""
+    if cfg.metric_mode == "leaderboard":
+        # The run's own score field is the ranked geomean at full precision; the printed
+        # line is the same number formatted, so it only matters when the API is down.
+        seconds = timing.score if timing.score is not None else parse_leaderboard_score_s(
+            timing.text
+        )
+        if seconds is None:
+            return None, "popcorn leaderboard run reported no public geomean score", {}
+        return seconds * 1e6, None, {"geomean_s": seconds}
+
+    extra: dict[str, Any] = {}
+    gm = geomean_us(shapes)
+    if gm is not None:
+        extra["geomean_us"] = round(gm, 4)
+    if cfg.metric_mode == "geomean":
+        if gm is None:
+            return None, "popcorn benchmark produced no usable timings", extra
+        return gm, None, extra
+
+    idx = cfg.benchmark_index
+    if idx >= len(shapes):
+        return None, (
+            f"benchmark_index {idx} is out of range: the run reported "
+            f"{len(shapes)} benchmark shapes"
+        ), extra
+    target = shapes[idx]
+    # Positional selection is only safe while the row list is complete. If a row is ever
+    # dropped -- an unparsed failure row is the realistic way -- every later index shifts
+    # and the metric silently comes from a different shape, which the search would then
+    # happily optimise. Pinning the spec turns that into a loud failure.
+    if cfg.benchmark_spec:
+        want = spec_fields(cfg.benchmark_spec)
+        if want and spec_fields(target.spec) != want:
+            found = next(
+                (s.index for s in shapes if spec_fields(s.spec) == want), None
+            )
+            where = (
+                f"it is at index {found} instead"
+                if found is not None
+                else f"it is absent from the {len(shapes)} shapes reported"
+            )
+            return None, (
+                f"benchmark_index {idx} is '{target.spec}', not the pinned "
+                f"'{cfg.benchmark_spec}' -- {where}. Refusing to score a shape this "
+                f"problem does not target; fix benchmark_index/benchmark_spec, or "
+                f"check whether a benchmark row failed to parse."
+            ), extra
+    extra.update(
+        {
+            "target_index": idx,
+            "target_spec": target.spec,
+            "mean_us": target.mean_us,
+            "err_us": target.err_us,
+            "best_us": target.best_us,
+            "worst_us": target.worst_us,
+        }
+    )
+    if target.mean_us is None:
+        return None, (
+            f"benchmark shape {idx} ({target.spec}) reported no time"
+            + (f": {target.error[:300]}" if target.error else "")
+        ), extra
+    return target.mean_us, None, extra
+
+
+def score(
+    problem: Problem, worktree: Path, *, test_only: bool = False
+) -> tuple[bool, float | None, str | None, dict[str, Any]]:
+    """Score a worktree through the hosted popcorn service.
+
+    Returns ``(correct, metric, err, detail)`` -- the same tuple ``bench.score`` returns,
+    so ``cli.score_command`` can emit an identical verdict either way. ``metric`` is in
+    microseconds and lower is better, so a popcorn problem sets ``direction: minimize``.
+    """
+    try:
+        cfg = resolve_config(problem)
+    except PopcornError as e:
+        return False, None, str(e), {}
+
+    detail: dict[str, Any] = {
+        "backend": "popcorn",
+        "leaderboard": cfg.leaderboard,
+        "gpu": cfg.gpu,
+        "metric_mode": cfg.metric_mode,
+    }
+    sub_path = Path(worktree) / problem.rel_dir / cfg.submission_file
+    try:
+        source = sub_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return False, None, f"submission not readable at {sub_path}: {e}", detail
+
+    err = _precheck(cfg, source)
+    if err:
+        return False, None, err, detail
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    detail["sha256"] = digest[:16]
+
+    wall: dict[str, float] = {}
+    ids: dict[str, int] = {}
+    cached: dict[str, bool] = {}
+    sources: dict[str, str] = {}
+
+    def run(mode: str) -> Submission:
+        sub = submit(cfg, sub_path, mode, digest)
+        wall[mode] = sub.wall_s
+        cached[mode] = sub.cached
+        sources[mode] = sub.source
+        sid = sub.submission_id
+        if sid is not None:
+            ids[mode] = sid
+        return sub
+
+    try:
+        test_sub = run(MODE_TEST)
+        report = (
+            test_report_from_result(test_sub.raw)
+            if test_sub.raw
+            else parse_test_output(test_sub.text)
+        )
+        detail["test"] = report.record()
+        total = report.passed + report.failed
+        if total == 0:
+            job = parse_summary_json(test_sub.text).get("job") or {}
+            reason = str(job.get("error") or "").strip()
+            raise PopcornError(
+                "popcorn test reported no shapes" + (f": {reason[:500]}" if reason else "")
+            )
+        if report.failed:
+            detail.update(
+                {"wall_s": wall, "submission_ids": ids, "cached": cached, "source": sources}
+            )
+            return False, None, _test_error(report, total), detail
+        if test_only:
+            detail.update(
+                {"wall_s": wall, "submission_ids": ids, "cached": cached, "source": sources}
+            )
+            return True, None, None, detail
+
+        timing = run(cfg.timing_mode)
+        shapes = (
+            shapes_from_result(timing.raw) if timing.raw else parse_benchmark_output(timing.text)
+        )
+        if shapes:
+            detail["shapes"] = [s.record() for s in shapes]
+        failed = [s for s in shapes if s.status == "fail"]
+        metric, metric_err, extra = _metric_from(cfg, shapes, timing)
+        detail.update(extra)
+        detail.update(
+            {"wall_s": wall, "submission_ids": ids, "cached": cached, "source": sources}
+        )
+        if failed:
+            specs = ", ".join(s.spec for s in failed[:3])
+            body = " ".join(failed[0].error.split())[:400]
+            return False, metric, (
+                f"popcorn {cfg.timing_mode}: {len(failed)} shape(s) failed re-check "
+                f"({specs})" + (f": {body}" if body else "")
+            ), detail
+        if metric_err:
+            return True, None, metric_err, detail
+        return True, metric, None, detail
+    except PopcornError as e:
+        detail.update(
+            {"wall_s": wall, "submission_ids": ids, "cached": cached, "source": sources}
+        )
+        return False, None, str(e), detail
+
+
+def score_command(problem: Problem, args: Any) -> int:
+    """``kernelthing score`` for a popcorn-backed problem: print the verdict JSON line.
+
+    Mirrors the pygpubench branch's contract exactly -- one JSON object on stdout, exit 0
+    only when the submission is correct. ``--emit-baseline`` / ``--baseline-median`` are
+    accepted and ignored: the metric is an absolute time, so there is no denominator to
+    pin, and the orchestrator's seed path already tolerates a missing baseline.
+    """
+    correct, metric, err, detail = score(
+        problem, problem.repo_root, test_only=bool(getattr(args, "test_only", False))
+    )
+    result: dict[str, Any] = {
+        "unit": problem.unit,
+        "correct": correct,
+        "metric": metric,
+        "error": err,
+        "bench": detail,
+    }
+    if getattr(args, "emit_baseline", False):
+        result["baseline_median"] = None
+    print(json.dumps(result))
+    if err and not correct:
+        print(err, file=sys.stderr)
+    return 0 if correct else 1

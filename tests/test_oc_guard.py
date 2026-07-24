@@ -249,14 +249,14 @@ def test_no_config_allows_everything(tmp_path):
     assert not r["blocked"]
 
 
-# --- GPU allocation hardening (bash) ----------------------------------------
-# GPU access is mediated by the libktgpu.so LD_PRELOAD shim (auto-assigns a
-# locked card on first CUDA use). Running GPU tools directly is fine now; what is
-# blocked is any attempt to touch or inspect the allocation machinery.
+# --- env-tampering hardening (bash) -----------------------------------------
+# Scoring is remote (no local GPU-lock shim), but the CUDA/loader environment and the
+# guard's own internals stay off-limits as defensive hygiene. Running GPU tools directly
+# is fine; what is blocked is any attempt to set/unset or inspect that environment.
 
 
 def test_bash_ncu_runs_unwrapped(tmp_path):
-    # No wrapper needed anymore -- the shim assigns a card transparently.
+    # Profiling tools run without a wrapper; only env tampering is blocked.
     cfg = _cfg(tmp_path)
     r = _decide(cfg, "bash", {"command": "/usr/local/cuda/bin/ncu --set full ./bench"})
     assert not r["blocked"]
@@ -325,4 +325,56 @@ def test_bash_ncu_report_parser_not_blocked(tmp_path):
         "bash",
         {"command": "python vendor/ncu-report-skill/helpers/analyze_reports.py --run-dir profile"},
     )
+    assert not r["blocked"]
+
+
+# --- remote (popcorn) submissions -------------------------------------------
+# Remotely-scored problems submit to a public competition service. Correctness,
+# timing and profiling runs are the candidate's to make; a *ranked* submission
+# publishes to the board and draws a separate rate limit, so it stays a human call.
+
+
+def test_bash_popcorn_leaderboard_submission_blocked(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(
+        cfg,
+        "bash",
+        {"command": "popcorn submit sub.py --leaderboard cholesky --gpu B200 --mode leaderboard"},
+    )
+    assert r["blocked"] and "leaderboard" in r["message"].lower()
+
+
+def test_bash_popcorn_leaderboard_equals_form_blocked(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "popcorn-cli submit s.py --mode=leaderboard --no-tui"})
+    assert r["blocked"]
+
+
+def test_bash_popcorn_test_and_benchmark_allowed(tmp_path):
+    cfg = _cfg(tmp_path)
+    for mode in ("test", "benchmark"):
+        r = _decide(
+            cfg,
+            "bash",
+            {"command": f"popcorn submit sub.py --leaderboard cholesky --mode {mode} --no-tui"},
+        )
+        assert not r["blocked"], mode
+
+
+def test_bash_popcorn_profile_brev_allowed(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(
+        cfg,
+        "bash",
+        {"command": "popcorn submit ../submission.py --leaderboard cholesky --profile-brev "
+                    "--benchmark-index 2 --no-tui --output brev.json"},
+    )
+    assert not r["blocked"]
+
+
+def test_bash_popcorn_leaderboard_flag_alone_allowed(tmp_path):
+    # `--leaderboard <name>` merely names the competition; only `--mode leaderboard`
+    # is a ranked submission.
+    cfg = _cfg(tmp_path)
+    r = _decide(cfg, "bash", {"command": "popcorn submissions list --leaderboard cholesky"})
     assert not r["blocked"]

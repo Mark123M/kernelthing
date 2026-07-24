@@ -27,7 +27,7 @@ function initState() {
     problem: '', unit: '', direction: 'maximize', model: '',
     control: {parallelism: 0, elite_k: 4, wall_clock_s: 0, max_candidates: 0,
               explore_bias: 50, explore_auto: true, stop: false},
-    phase: '—', baselines: {},
+    phase: '—',
     members: new Map(), inflight: new Map(),
     best: null, dispatched: 0, cost: 0,
     startT: null, searchStart: null, end: null, lastT: null,
@@ -47,10 +47,9 @@ function applyEvent(s, e) {
       break;
     case 'phase': s.phase = e.phase; break;
     case 'search_start': s.searchStart = e.t; break;
-    case 'baseline_pinned': s.baselines[e.gpu] = e.median_us; break;
     case 'control_changed': Object.assign(s.control, e.changes); break;
     case 'dispatch':
-      s.inflight.set(e.member, {id: e.member, op: e.op, parent: e.parent, gpu: e.gpu, t: e.t});
+      s.inflight.set(e.member, {id: e.member, op: e.op, parent: e.parent, t: e.t});
       s.dispatched = e.dispatched;
       break;
     case 'member_result':
@@ -58,7 +57,7 @@ function applyEvent(s, e) {
       s.members.set(e.member, {
         id: e.member, op: e.op, parent: e.parent, metric: e.metric, correct: e.correct,
         message: e.message || '', commit: (e.commit || '').slice(0, 8), error: e.error,
-        cost: e.cost || 0, gpu: e.gpu, agent_s: e.agent_s, score_s: e.score_s,
+        cost: e.cost || 0, agent_s: e.agent_s, score_s: e.score_s,
       });
       s.cost += e.cost || 0;
       break;
@@ -258,7 +257,7 @@ function drawAgents() {
     const text = en.last_text ? `<div class=ln>💬 ${esc(en.last_text)}</div>` : '';
     return `<div class="agent${selMember === a.id ? ' sel' : ''}" onclick="loadMember(${a.id})">
       <div class=top><span class="${opClass(a.op)}">${a.op}</span>
-        <span class=id>mem ${a.id}</span><span class=meta>${par} · GPU ${a.gpu}</span></div>
+        <span class=id>mem ${a.id}</span><span class=meta>${par}</span></div>
       <div class=meta>⚙ ${en.tools || 0} tools${cost}</div>${tool}${text}</div>`;
   }).join('');
 }

@@ -1,0 +1,81 @@
+n: 32; cond: 2; seed: 41032; batch: 4096
+ ⏱ 113 ± 0.0 µs
+ ⚡ 113 µs 🐌 113 µs
+
+n: 64; cond: 2; seed: 41064; batch: 1024
+ ⏱ 110 ± 0.0 µs
+ ⚡ 110 µs 🐌 110 µs
+
+n: 128; cond: 2; seed: 41128; batch: 256
+ ⏱ 75.1 ± 0.07 µs
+ ⚡ 74.6 µs 🐌 76.2 µs
+
+n: 256; cond: 2; seed: 41256; batch: 64
+ ⏱ 276 ± 0.1 µs
+ ⚡ 276 µs 🐌 277 µs
+
+n: 512; cond: 2; seed: 41512; batch: 16
+ ⏱ 604 ± 0.1 µs
+ ⚡ 604 µs 🐌 604 µs
+
+n: 512; cond: 2; seed: 510512; batch: 640
+ ⏱ 3.78 ± 0.001 ms
+ ⚡ 3.78 ms 🐌 3.79 ms
+
+n: 1024; cond: 2; seed: 42024; batch: 4
+ ⏱ 1328 ± 0.6 µs
+ ⚡ 1327 µs 🐌 1329 µs
+
+n: 1024; cond: 2; seed: 511024; batch: 60
+ ⏱ 2.89 ± 0.001 ms
+ ⚡ 2.89 ms 🐌 2.90 ms
+
+n: 2048; cond: 2; seed: 44048; batch: 2
+ ⏱ 3.44 ± 0.001 ms
+ ⚡ 3.43 ms 🐌 3.44 ms
+
+n: 2048; cond: 2; seed: 512048; batch: 8
+ ⏱ 5.06 ± 0.004 ms
+ ⚡ 5.05 ms 🐌 5.07 ms
+
+n: 4096; cond: 2; seed: 48096; batch: 1
+ ⏱ 1533 ± 1.0 µs
+ ⚡ 1531 µs 🐌 1537 µs
+
+n: 4096; cond: 2; seed: 514096; batch: 2
+ ⏱ 11.9 ± 0.00 ms
+ ⚡ 11.9 ms 🐌 11.9 ms
+
+n: 8192; cond: 2; seed: 48192; batch: 1
+ ⏱ 6.40 ± 0.002 ms
+ ⚡ 6.40 ms 🐌 6.41 ms
+
+n: 16384; cond: 2; seed: 48284; batch: 1
+ ⏱ 34.2 ± 0.01 ms
+ ⚡ 34.2 ms 🐌 34.2 ms
+
+n: 32768; cond: 2; seed: 48368; batch: 1
+ ⏱ 221 ± 0.0 ms
+ ⚡ 221 ms 🐌 221 ms
+
+{
+  "done": true,
+  "file_name": "submission.py",
+  "job": {
+    "error": null,
+    "status": "succeeded"
+  },
+  "leaderboard": "cholesky",
+  "runs": [
+    {
+      "end_time": "2026-07-24T00:51:16.176310Z",
+      "mode": "benchmark",
+      "passed": true,
+      "runner": "B200",
+      "score": null,
+      "secret": false,
+      "start_time": "2026-07-24T00:46:18.466151Z"
+    }
+  ],
+  "submission_id": 900990
+}
