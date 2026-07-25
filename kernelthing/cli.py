@@ -15,7 +15,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import bootstrap
+from . import archive, bootstrap, journal
 from .config import Config
 from .orchestrator import Orchestrator
 from .problem import Problem, load_problem, prepare_problem
@@ -120,6 +120,7 @@ def run_loop(args: argparse.Namespace) -> int:
         elite_k=args.elite_k,
         min_niches=args.min_niches,
         problem_root=args.problem_root,
+        archive_root=None if args.no_archive else args.archive_root,
     )
 
     try:
@@ -254,12 +255,82 @@ def web_command(argv: list[str]) -> int:
     return 0
 
 
+def archive_command(argv: list[str]) -> int:
+    """``kernelthing archive``: export runs out of the managed root by hand.
+
+    A run archives itself when it ends, so this is for the runs that never got
+    to end -- a killed process, a machine that restarted mid-search. Their
+    artifacts are still sitting in the managed root, intact but one
+    ``prepare_problem`` away from being rebuilt over.
+    """
+    p = argparse.ArgumentParser(
+        prog="kernelthing archive",
+        description="Copy run artifacts (journal, members, git bundle, best "
+        "kernel) out of the disposable managed root into a durable archive. "
+        "With no RUN_ID, archives every run found.",
+    )
+    p.add_argument(
+        "run_id",
+        nargs="*",
+        metavar="RUN_ID",
+        help="run ids to archive, as printed by --list (default: all of them)",
+    )
+    p.add_argument(
+        "--root",
+        type=Path,
+        default=Path.home() / ".cache" / "kernelthing",
+        help="managed root to read runs from (default: %(default)s)",
+    )
+    p.add_argument(
+        "--archive-root",
+        type=Path,
+        default=archive.default_archive_root(),
+        help="destination archive root (default: %(default)s)",
+    )
+    p.add_argument("--list", action="store_true", help="list run ids under --root and exit")
+    args = p.parse_args(argv)
+
+    runs = journal.discover_runs(args.root)
+    if args.list:
+        if not runs:
+            print(f"no runs under {args.root}", file=sys.stderr)
+        for r in runs:
+            meta = r.get("run") or {}
+            live = " (live)" if r.get("live") else ""
+            print(f"{r['id']}{live}  {(meta.get('problem') or {}).get('name', '?')}")
+        return 0
+
+    def say(msg: str) -> None:
+        print(f"[kernelthing] {msg}", file=sys.stderr)
+
+    if not runs:
+        print(f"error: no runs found under {args.root}", file=sys.stderr)
+        return 2
+    known = {str(r["id"]) for r in runs}
+    unknown = [r for r in args.run_id if r not in known]
+    if unknown:
+        print(f"error: no such run under {args.root}: {', '.join(unknown)}", file=sys.stderr)
+        return 2
+
+    done = archive.export_all(
+        args.root, args.archive_root, run_ids=args.run_id or None, log=say
+    )
+    print(
+        f"[kernelthing] archived {len(done)} run(s) to {args.archive_root}\n"
+        f"[kernelthing] browse:   kernelthing web --root {args.archive_root}",
+        file=sys.stderr,
+    )
+    return 0 if done else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "score":
         return score_command(argv[1:])
     if argv and argv[0] == "web":
         return web_command(argv[1:])
+    if argv and argv[0] == "archive":
+        return archive_command(argv[1:])
 
     parser = argparse.ArgumentParser(
         prog="kernelthing",
@@ -270,7 +341,10 @@ def main(argv: list[str] | None = None) -> int:
         "                  print {correct, metric, unit} -- the same scoring the loop\n"
         "                  uses; run `kernelthing score --help` for details\n"
         "  web             serve the web UI standalone over all runs (live and\n"
-        "                  finished) under --root; run `kernelthing web --help`",
+        "                  finished) under --root; run `kernelthing web --help`\n"
+        "  archive         copy run artifacts out of the disposable managed root\n"
+        "                  into a durable archive; for runs that died before they\n"
+        "                  could archive themselves (a finished run does it itself)",
     )
     parser.add_argument(
         "problem",
@@ -386,6 +460,20 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path.home() / ".cache" / "kernelthing",
         help="managed problem repo root (worktrees branch from copies here)",
+    )
+    runtime.add_argument(
+        "--archive-root",
+        type=Path,
+        default=archive.default_archive_root(),
+        help="durable artifact archive: the run's journal, members, git bundle "
+        "and best kernel are copied here when the run ends, outside the "
+        "disposable --problem-root. Serve it with `kernelthing web --root`. "
+        "Default: %(default)s",
+    )
+    runtime.add_argument(
+        "--no-archive",
+        action="store_true",
+        help="do not copy artifacts out of --problem-root when the run ends",
     )
     runtime.add_argument(
         "--methodology",

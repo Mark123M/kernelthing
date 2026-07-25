@@ -24,6 +24,9 @@ kernelthing problems/<name> -j 8       # run the loop; web UI at http://127.0.0.
 kernelthing score <problem-dir>        # authoritative scorer, prints {correct, metric, unit}
 kernelthing score <dir> --test-only    # correctness only; halves the cost on popcorn problems
 kernelthing web --root ~/.cache/kernelthing   # replay/serve runs with no loop process
+kernelthing web --root ~/.local/share/kernelthing/runs   # ...the same, over the durable archive
+kernelthing archive --list                    # runs still sitting in the disposable managed root
+kernelthing archive                           # export them (runs do this themselves on exit)
 python -m kernelthing ...              # equivalent to the `kernelthing` entry point
 ```
 
@@ -78,6 +81,32 @@ Everything lands in `<problem-repo>/.humanize/rlcr/<timestamp>/` (see `state.py:
 introduce shared in-memory state between the orchestrator and the web server — the decoupling is what
 makes finished runs replay identically to live ones, and lets `kernelthing web` serve runs from
 unrelated processes. NDJSON over SQLite is deliberate: runs are debuggable with `tail`/`grep`/`jq`.
+
+### Run artifacts are durable — two mechanisms, and both matter (`archive.py`)
+
+The run dir lives inside the managed repo under `~/.cache/kernelthing/<problem>/`, which is
+XDG-disposable *and* rebuilt by `prepare_problem` on every run. That combination once meant starting a
+second run silently destroyed the first one's entire record. Two independent guarantees now:
+
+1. **`prepare_problem` preserves `.humanize/`** (`problem.NO_COPY` / `problem.PRESERVE`). It clears
+   the managed dir entry-by-entry instead of `rmtree`-ing it, so the kept subtree is never moved and
+   no crash can strand it. `.git/info/exclude` is written *before* the first `git add -A` — otherwise
+   the preserved tree enters the initial commit and every worktree materialises every past run. This
+   is what survives a hard power loss, since nothing gets to run an exit hook.
+2. **Runs archive themselves on exit** (`Orchestrator._archive_run`, called from `run()`'s `finally`,
+   after `journal.close()`). Artifacts are copied to `cfg.archive_root`
+   (`~/.local/share/kernelthing/runs`, XDG *data*), covering clean exits, stalls, stops, exceptions
+   and Ctrl-C. `kernelthing archive` does it by hand for runs whose process died first.
+
+The archive layout **mirrors the managed root** (`<archive>/<problem>/.humanize/rlcr/<ts>/`) so an
+archive root is a drop-in for `kernelthing web --root` — `discover_runs` globs `<root>/*/.humanize/
+rlcr/*` and needs no special-casing. Beside it go the two things the run dir lacks: `bundles/<ts>.bundle`
+(all member commits, since the managed repo is rebuilt away) and `best/<ts>/`.
+
+The best kernel is taken from **the journal, not HEAD** (`_best_scored_member` folds `events.ndjson`
+exactly like the UI does). They agree only for a clean exit; a killed run never promoted its winner,
+so HEAD is still the seed. Archiving is best-effort everywhere and swallows its own errors — a failed
+copy must never change a run's exit status.
 
 ### There is no local GPU path — scoring is remote
 
@@ -183,7 +212,10 @@ A problem is a directory with `problem.json` inside a git repo:
 `prepare_problem()` **copies** the problem dir into a standalone git repo at
 `~/.cache/kernelthing/<name>/` and `git init`s it — the source repo is never touched, and worktrees
 branch from that copy under `<problem_root>/wt/<ts>/evolve/`. `rewrite_plan_for_worktree` fixes up
-plan paths because the problem sits at the repo root there, not under `problems/<name>/`.
+plan paths because the problem sits at the repo root there, not under `problems/<name>/`. It rebuilds
+that repo on every run but **preserves `.humanize/`** and skips `runs/` in the copy (see the artifact
+section above) — a `runs/` archive kept next to a problem must not end up committed into the managed
+repo and materialised in every worktree.
 
 ### Anti-cheat is layered, and every gate fails open
 

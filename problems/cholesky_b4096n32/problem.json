@@ -1,0 +1,27 @@
+{
+  "name": "cholesky_b4096n32",
+  "description": "Batched dense Cholesky factorization, batch=4096 n=32 fp32, on B200 via the gpu-mode popcorn leaderboard",
+  "plan": "plan.md",
+  "edit_files": [
+    "submission.py"
+  ],
+  "gpu": "",
+  "metric_name": "b4096n32",
+  "unit": "us",
+  "direction": "minimize",
+  "bench": {
+    "backend": "popcorn",
+    "popcorn": {
+      "leaderboard": "cholesky",
+      "gpu": "B200",
+      "submission_file": "submission.py",
+      "benchmark_index": 0,
+      "benchmark_spec": "n: 32; cond: 2; seed: 41032; batch: 4096",
+      "metric_mode": "shape",
+      "timeout_s": 1200,
+      "reject_substrings": [
+        "stream"
+      ]
+    }
+  }
+}

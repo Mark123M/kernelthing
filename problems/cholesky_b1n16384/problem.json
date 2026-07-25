@@ -1,0 +1,27 @@
+{
+  "name": "cholesky_b1n16384",
+  "description": "Batched dense Cholesky factorization, batch=1 n=16384 fp32, on B200 via the gpu-mode popcorn leaderboard",
+  "plan": "plan.md",
+  "edit_files": [
+    "submission.py"
+  ],
+  "gpu": "",
+  "metric_name": "b1n16384",
+  "unit": "us",
+  "direction": "minimize",
+  "bench": {
+    "backend": "popcorn",
+    "popcorn": {
+      "leaderboard": "cholesky",
+      "gpu": "B200",
+      "submission_file": "submission.py",
+      "benchmark_index": 13,
+      "benchmark_spec": "n: 16384; cond: 2; seed: 48284; batch: 1",
+      "metric_mode": "shape",
+      "timeout_s": 1200,
+      "reject_substrings": [
+        "stream"
+      ]
+    }
+  }
+}

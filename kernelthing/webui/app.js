@@ -124,6 +124,10 @@ async function poll() {
 /* ---------- render ---------- */
 function render() {
   if (!S) return;
+  const inflightCost = [...S.inflight.keys()].reduce((sum, id) => {
+    const c = AGENTS[id] && Number(AGENTS[id].cost);
+    return sum + (Number.isFinite(c) ? c : 0);
+  }, 0);
   $('problem').innerHTML = '<b>' + esc(S.problem || '-') + '</b>' + (S.unit ? ' · ' + S.unit : '');
   $('phase').textContent = 'phase ' + (S.phase || '-');
   $('best').innerHTML = 'best <b>' + fmt(S.best) + '</b>';
@@ -131,7 +135,7 @@ function render() {
   $('kernels').innerHTML = '<b>' + S.dispatched + cap + '</b> kernels';
   $('agentsN').innerHTML = '<b>' + S.inflight.size +
     (LIVE ? '/' + S.control.parallelism : '') + '</b> agents';
-  $('cost').innerHTML = '$<b>' + S.cost.toFixed(2) + '</b>';
+  $('cost').innerHTML = '$<b>' + (S.cost + inflightCost).toFixed(2) + '</b>';
   $('ctl').textContent = LIVE && S.control.stop ? 'stop requested — finishing in-flight work…' : '';
   $('liveCtls').classList.toggle('hidden', !LIVE);
   renderClock();

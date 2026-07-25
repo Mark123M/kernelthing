@@ -108,7 +108,11 @@ def summarize_agent_log(path: Path) -> dict[str, Any]:
     out: dict[str, Any] = {"tools": 0, "cost": 0.0, "last_tool": "", "last_text": ""}
     if not path.is_file():
         return out
-    for line in tail_text(path).splitlines():
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return out
+    for line in lines:
         line = line.strip()
         if not line:
             continue
@@ -125,8 +129,8 @@ def summarize_agent_log(path: Path) -> dict[str, Any]:
             if line_txt:
                 out["last_tool"] = line_txt[:160]
         elif d["type"] == "step_finish":
-            if part.get("cost"):
-                out["cost"] = part["cost"]
+            if part.get("cost") is not None:
+                out["cost"] += float(part["cost"] or 0.0)
     out["cost"] = round(float(out["cost"] or 0.0), 4)
     return out
 

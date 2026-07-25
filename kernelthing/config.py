@@ -81,3 +81,8 @@ class Config:
     # Managed repo root: problem dirs are copied into standalone git repos here so
     # worktrees always branch from committed state.
     problem_root: Path = Path.home() / ".cache" / "kernelthing"
+    # Durable archive root: a finished run's artifacts are copied out of
+    # problem_root (which is XDG-disposable, and which prepare_problem rebuilds on
+    # every run) to here, where nothing kernelthing does touches them again. XDG
+    # *data*, not cache, on purpose. None disables archiving. See archive.py.
+    archive_root: Path | None = Path.home() / ".local" / "share" / "kernelthing" / "runs"

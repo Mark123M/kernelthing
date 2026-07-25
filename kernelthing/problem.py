@@ -14,6 +14,7 @@ the enclosing git repo root (so worktrees and @file mentions work).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import subprocess
@@ -94,16 +95,33 @@ def load_problem(path: str | Path) -> Problem:
     )
 
 
+# Never copied from the source problem dir into the managed repo: build noise,
+# and the two artifact trees (a run's own record, and archives of past runs).
+# Copying those in would commit them to the initial commit, so every worktree
+# would then materialise every past run.
+NO_COPY = frozenset({"__pycache__", ".humanize", "runs", ".git"})
+
+# Kept across the managed repo's rebuild -- this is the run record (journal,
+# members, results). See kernelthing/archive.py for why losing it was expensive.
+PRESERVE = frozenset({".humanize"})
+
+
 def prepare_problem(problem: Problem, managed_root: Path) -> Problem:
     """Copy the problem dir into a standalone git repo at ``managed_root/<name>/``
     and return a new Problem rooted there. All worktrees branch from this repo,
-    so the source repo (kernelthing itself) is never touched."""
+    so the source repo (kernelthing itself) is never touched.
+
+    The managed repo is rebuilt from scratch on every run -- fresh ``git init``,
+    one initial commit -- but rebuilding is *not* the same as erasing. Past runs'
+    artifacts under ``.humanize/`` are preserved: they are the only record that a
+    run ever happened, they are what the web UI replays, and a run that died to a
+    crashed machine has nothing else left. Deleting them here used to be how you
+    lost a finished experiment by starting the next one."""
     dest = managed_root / problem.name
-    if dest.exists():
-        shutil.rmtree(dest)
+    _clear_except(dest, PRESERVE)
     dest.mkdir(parents=True, exist_ok=True)
     for item in problem.dir.iterdir():
-        if item.name == "__pycache__":
+        if item.name in NO_COPY:
             continue
         if item.is_dir():
             shutil.copytree(item, dest / item.name, dirs_exist_ok=True)
@@ -113,6 +131,10 @@ def prepare_problem(problem: Problem, managed_root: Path) -> Problem:
     rewrite_plan_for_worktree(dest, problem)
 
     subprocess.run(["git", "init", "-b", "main"], cwd=dest, check=True, capture_output=True)
+    # Written before the first `git add -A`: the preserved artifact tree is
+    # sitting in the working dir now, and must never enter the index (it would
+    # put every past run into the initial commit, and into every worktree).
+    _write_git_exclude(dest, PRESERVE)
     subprocess.run(["git", "add", "-A"], cwd=dest, check=True, capture_output=True)
     subprocess.run(
         ["git", "commit", "--allow-empty", "-m", "initial problem"],
@@ -122,6 +144,41 @@ def prepare_problem(problem: Problem, managed_root: Path) -> Problem:
     )
 
     return load_problem(dest / "problem.json")
+
+
+def _clear_except(dest: Path, keep: frozenset[str]) -> None:
+    """Empty ``dest`` of everything but ``keep``.
+
+    Deleting entry-by-entry rather than ``rmtree(dest)`` + recreate is what makes
+    the preservation safe: the kept subtree is never moved, so there is no window
+    where a crash strands it somewhere the next run will not look."""
+    if not dest.is_dir():
+        return
+    for item in dest.iterdir():
+        if item.name in keep:
+            continue
+        if item.is_dir() and not item.is_symlink():
+            shutil.rmtree(item, ignore_errors=True)
+        else:
+            with contextlib.suppress(OSError):
+                item.unlink()
+
+
+def _write_git_exclude(dest: Path, names: frozenset[str]) -> None:
+    """Mark the preserved artifact dirs untracked-forever for this repo.
+
+    ``.git/info/exclude`` rather than ``.gitignore``: the exclude file is not a
+    tracked file, so it never shows up in a candidate's diff, and it is shared by
+    every worktree -- which is also where a candidate's own ``.humanize/`` scratch
+    dir would otherwise land in its ``git add -A``."""
+    info = dest / ".git" / "info"
+    with contextlib.suppress(OSError):
+        info.mkdir(parents=True, exist_ok=True)
+        (info / "exclude").write_text(
+            "# written by kernelthing: run artifacts are never tracked\n"
+            + "".join(f"/{n}/\n" for n in sorted(names)),
+            encoding="utf-8",
+        )
 
 
 def rewrite_plan_for_worktree(dest: Path, problem: Problem) -> None:

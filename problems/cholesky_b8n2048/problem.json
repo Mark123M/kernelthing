@@ -1,0 +1,27 @@
+{
+  "name": "cholesky_b8n2048",
+  "description": "Batched dense Cholesky factorization, batch=8 n=2048 fp32, on B200 via the gpu-mode popcorn leaderboard",
+  "plan": "plan.md",
+  "edit_files": [
+    "submission.py"
+  ],
+  "gpu": "",
+  "metric_name": "b8n2048",
+  "unit": "us",
+  "direction": "minimize",
+  "bench": {
+    "backend": "popcorn",
+    "popcorn": {
+      "leaderboard": "cholesky",
+      "gpu": "B200",
+      "submission_file": "submission.py",
+      "benchmark_index": 9,
+      "benchmark_spec": "n: 2048; cond: 2; seed: 512048; batch: 8",
+      "metric_mode": "shape",
+      "timeout_s": 1200,
+      "reject_substrings": [
+        "stream"
+      ]
+    }
+  }
+}

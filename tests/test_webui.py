@@ -337,6 +337,7 @@ def test_summarize_agent_log_extracts_tools_text_cost(tmp_path: Path):
         _ndjson(
             {"type": "text", "part": {"text": "trying cp.async   staging"}},
             {"type": "tool_use", "part": {"name": "bash", "input": {"command": "nvcc -O3 a.cu"}}},
+            {"type": "step_finish", "part": {"cost": 0.004}},
             {"type": "tool_use", "part": {"name": "edit", "input": {"filePath": "submission.py"}}},
             {"type": "step_finish", "part": {"cost": 0.0123}},
         ),
@@ -346,4 +347,4 @@ def test_summarize_agent_log_extracts_tools_text_cost(tmp_path: Path):
     assert s["tools"] == 2
     assert s["last_tool"] == "edit submission.py"
     assert s["last_text"] == "trying cp.async staging"
-    assert s["cost"] == 0.0123
+    assert s["cost"] == 0.0163

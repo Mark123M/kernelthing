@@ -45,3 +45,35 @@ def test_parse_ndjson_surfaces_error_event():
     assert tokens == {}
     assert tool_calls == 0
     assert error == "UnknownError: Unexpected server error. Check server logs for details. (ref err_abc)"
+
+
+def test_parse_ndjson_sums_step_costs_and_tokens():
+    lines = [
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": "ses_123",
+                "part": {
+                    "cost": 0.001,
+                    "tokens": {"input": 10, "output": 2, "cache": {"read": 3}},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": "ses_123",
+                "part": {
+                    "cost": 0.004,
+                    "tokens": {"input": 20, "reasoning": 5, "cache": {"read": 7}},
+                },
+            }
+        ),
+    ]
+
+    _text, _sid, cost, tokens, _tool_calls, _error = opencode_client.parse_ndjson(
+        "\n".join(lines)
+    )
+
+    assert round(cost, 6) == 0.005
+    assert tokens == {"input": 30, "output": 2, "reasoning": 5, "cache": {"read": 10}}

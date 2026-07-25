@@ -29,7 +29,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any
 
-from . import evolve, gates, opencode_client, prompts
+from . import archive, evolve, gates, opencode_client, prompts
 from .config import Config, format_duration
 from .journal import MAX_PARALLELISM, Journal, LiveLock, LoopControl
 from .problem import Problem
@@ -170,6 +170,7 @@ class Orchestrator:
         self._best: float | None = None
         self._dispatched = 0
         self._logfile: Path | None = None
+        self._dirs: LoopDirs | None = None  # set in setup(); read by _archive_run()
         self._git_lock = threading.Lock()
 
     # --- helpers ---
@@ -379,6 +380,7 @@ class Orchestrator:
         ts = new_timestamp()
         dirs = LoopDirs(self.wd, ts).ensure()
         self._logfile = dirs.logfile
+        self._dirs = dirs
         state = State(
             timestamp=ts,
             plan_file=self.problem.plan,
@@ -902,6 +904,29 @@ class Orchestrator:
                 self.journal.close()
             if self._live_lock is not None:
                 self._live_lock.release()
+            # After the journal closes, so the archived copy has the last events;
+            # in the finally, so a stop, a stall, an exception and a Ctrl-C all
+            # archive too -- the runs worth keeping are rarely the tidy ones.
+            self._archive_run()
+
+    def _archive_run(self) -> None:
+        """Copy this run's artifacts somewhere the next run cannot reach.
+
+        Best-effort by construction: ``archive.export_run`` swallows its own
+        failures, and the run's exit status must not depend on whether a copy
+        succeeded. Only a hard power-loss escapes this path -- and that case is
+        covered from the other side, by ``prepare_problem`` preserving the run
+        record in the managed root instead of deleting it."""
+        if self.cfg.archive_root is None or self._dirs is None:
+            return
+        archive.export_run(
+            self._dirs.base,
+            self.cfg.archive_root,
+            problem_name=self.problem.name,
+            repo=self.wd,
+            edit_files=self.problem.edit_files,
+            log=self._log,
+        )
 
     def _run(self) -> str:
         state, dirs = self.setup()
@@ -911,7 +936,12 @@ class Orchestrator:
         pop = evolve.Population(direction=self.problem.direction, elite_k=cfg.elite_k)
         base = self._git(["rev-parse", "HEAD"])
         self._base_commit = base
-        wt_root = cfg.problem_root / "wt" / state.timestamp / "evolve"
+        # Namespaced by problem: the managed root is shared by every problem, and
+        # the timestamp is only second-resolution, so two loops on *different*
+        # problems launched in the same second would otherwise share this dir --
+        # and the rmtree below (plus _evolve_cleanup's) would delete the other
+        # run's live worktrees out from under it.
+        wt_root = cfg.problem_root / "wt" / self.problem.name / state.timestamp / "evolve"
         shutil.rmtree(wt_root, ignore_errors=True)
         wt_root.mkdir(parents=True, exist_ok=True)
 

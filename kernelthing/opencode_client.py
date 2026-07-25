@@ -100,6 +100,19 @@ def _seed_auth_for_isolated_data(src_data_home: Path, dst_data_home: Path) -> No
         return
 
 
+def _add_tokens(total: dict[str, Any], inc: dict[str, Any]) -> None:
+    for key, value in inc.items():
+        if isinstance(value, dict):
+            child = total.setdefault(key, {})
+            if isinstance(child, dict):
+                _add_tokens(child, value)
+            else:
+                total[key] = dict(value)
+        elif isinstance(value, (int, float)):
+            prev = total.get(key, 0)
+            total[key] = (prev if isinstance(prev, (int, float)) else 0) + value
+
+
 def parse_ndjson(stdout: str) -> tuple[str, str | None, float, dict[str, Any], int, str | None]:
     text_parts: list[str] = []
     session_id: str | None = None
@@ -127,10 +140,10 @@ def parse_ndjson(stdout: str) -> tuple[str, str | None, float, dict[str, Any], i
         elif etype == "error":
             error = _error_text(ev)
         elif etype == "step_finish":
-            if part.get("cost"):
-                cost = part["cost"]
-            if part.get("tokens"):
-                tokens = part["tokens"]
+            if part.get("cost") is not None:
+                cost += float(part["cost"] or 0.0)
+            if isinstance(part.get("tokens"), dict):
+                _add_tokens(tokens, part["tokens"])
     return "".join(text_parts), session_id, cost, tokens, tool_calls, error
 
 
