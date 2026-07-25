@@ -27,6 +27,8 @@ kernelthing web --root ~/.cache/kernelthing   # replay/serve runs with no loop p
 kernelthing web --root ~/.local/share/kernelthing/runs   # ...the same, over the durable archive
 kernelthing archive --list                    # runs still sitting in the disposable managed root
 kernelthing archive                           # export them (runs do this themselves on exit)
+kernelthing transcripts --list                # runs visible to the transcript renderer
+kernelthing transcripts <run-id|path> -o DIR  # agents' NDJSON logs -> markdown (archiving does this too)
 python -m kernelthing ...              # equivalent to the `kernelthing` entry point
 ```
 
@@ -100,8 +102,23 @@ second run silently destroyed the first one's entire record. Two independent gua
 
 The archive layout **mirrors the managed root** (`<archive>/<problem>/.humanize/rlcr/<ts>/`) so an
 archive root is a drop-in for `kernelthing web --root` — `discover_runs` globs `<root>/*/.humanize/
-rlcr/*` and needs no special-casing. Beside it go the two things the run dir lacks: `bundles/<ts>.bundle`
-(all member commits, since the managed repo is rebuilt away) and `best/<ts>/`.
+rlcr/*` and needs no special-casing. Beside it go the things the run dir lacks: `bundles/<ts>.bundle`
+(all member commits, since the managed repo is rebuilt away), `best/<ts>/`, and `transcripts/<ts>/`
+(see below).
+
+### Transcripts (`transcript.py`)
+
+`members/<id>/opencode.ndjson` is the *complete* record of one agent (assistant prose, reasoning,
+every tool call with full input/output) but it is one JSON part per line, so reading a 750KB turn
+means writing a parser first. `transcript.py` is that fold, written to files instead of a socket:
+`export_transcripts(run_dir, out_dir)` writes `member-<id>.md` (prompt first, then the stream, nothing
+clipped), an `index.md`, and copies of the run-level logs. `export_run` calls it, so **every archived
+run — i.e. every run that ends — gets `transcripts/<ts>/` for free**; `kernelthing transcripts` covers
+what that misses (a live run, a run dir elsewhere on disk, a re-render with `--jsonl`/`--max-output`).
+It is a pure reader like `webui/`, and owns the NDJSON parsing helpers (`parts` / `tool_line` /
+`is_tool` / `clip`) that `webui` imports back — the format is opencode's wire format, not HTTP.
+Keep the transcript step inside its own `try` in `export_run`: a malformed log must not cost a run
+its archive.
 
 The best kernel is taken from **the journal, not HEAD** (`_best_scored_member` folds `events.ndjson`
 exactly like the UI does). They agree only for a clean exit; a killed run never promoted its winner,

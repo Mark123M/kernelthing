@@ -12,8 +12,10 @@ serves a web UI for watching progress and live-tuning N / the turn cap / stop.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from . import archive, bootstrap, journal
 from .config import Config
@@ -323,6 +325,131 @@ def archive_command(argv: list[str]) -> int:
     return 0 if done else 1
 
 
+def resolve_runs(target: str, roots: list[Path]) -> list[Path]:
+    """Run dirs named by ``target``: a path, a run id under a root, or ``all``.
+
+    A path is taken as given (a run dir, or any dir with runs beneath it) so a
+    run that was never archived -- or one sitting next to the problem in the
+    source repo -- resolves without a --root dance. Otherwise ``target`` is a run
+    id as ``kernelthing archive --list`` prints it, looked up in each root.
+    """
+    p = Path(target).expanduser()
+    if p.is_dir():
+        if (p / journal.RUN_JSON).is_file():
+            return [p.resolve()]
+        return [Path(r["dir"]) for r in _runs_under(p)]
+    hits = []
+    for root in roots:
+        for r in _runs_under(root):
+            if target in ("all", "*") or str(r["id"]) == target:
+                hits.append(Path(r["dir"]))
+    return hits
+
+
+def _runs_under(root: Path) -> list[dict[str, Any]]:
+    """``journal.discover_runs`` with the run dir resolved onto each entry."""
+    root = Path(root).expanduser()
+    return [{**r, "dir": root.resolve() / str(r["id"])} for r in journal.discover_runs(root)]
+
+
+def transcripts_command(argv: list[str]) -> int:
+    """``kernelthing transcripts``: flatten the agents' NDJSON logs to markdown.
+
+    Archiving already does this for every run it exports (``<archive>/<problem>/
+    transcripts/<ts>/``), so this is for the cases that miss that path: a run
+    still going, a run dir somewhere else on disk, or a re-render with ``--jsonl``
+    / a different clip.
+    """
+    from . import transcript
+
+    p = argparse.ArgumentParser(
+        prog="kernelthing transcripts",
+        description="Render every agent's full conversation (prompt, assistant "
+        "text, reasoning, and every tool call with its complete input and "
+        "output) to one markdown file per member.",
+    )
+    p.add_argument(
+        "run",
+        nargs="*",
+        metavar="RUN",
+        help="run ids (as printed by --list) or paths to run dirs; a dir with "
+        "runs beneath it works too. Default: every run found under --root.",
+    )
+    p.add_argument(
+        "--root",
+        type=Path,
+        action="append",
+        metavar="DIR",
+        help="root to resolve run ids under; repeatable. Default: the archive "
+        f"root ({archive.default_archive_root()}) then the managed root.",
+    )
+    p.add_argument(
+        "-o",
+        "--out",
+        type=Path,
+        default=Path("transcripts"),
+        help="output dir; each run lands in <out>/<problem>/<timestamp>/ "
+        "(default: ./%(default)s)",
+    )
+    p.add_argument(
+        "--jsonl",
+        action="store_true",
+        help="also write member-<id>.jsonl -- one normalised item per line, for "
+        "grep/jq over the stream",
+    )
+    p.add_argument(
+        "--max-output",
+        type=int,
+        default=0,
+        metavar="N",
+        help="clip each tool input/output to N characters (default: 0, verbatim)",
+    )
+    p.add_argument("--list", action="store_true", help="list run ids under the roots and exit")
+    args = p.parse_args(argv)
+
+    roots = args.root or [archive.default_archive_root(), Path.home() / ".cache" / "kernelthing"]
+    if args.list:
+        for root in roots:
+            for r in _runs_under(root):
+                meta = r.get("run") or {}
+                live = " (live)" if r.get("live") else ""
+                print(f"{r['id']}{live}  {(meta.get('problem') or {}).get('name', '?')}  {root}")
+        return 0
+
+    run_dirs: list[Path] = []
+    for target in args.run or ["all"]:
+        found = resolve_runs(target, roots)
+        if not found:
+            print(f"error: no run matching '{target}'", file=sys.stderr)
+            return 2
+        run_dirs += [d for d in found if d not in run_dirs]
+
+    total = 0
+    for run_dir in run_dirs:
+        dest = args.out / _problem_name(run_dir) / run_dir.name
+        ids = transcript.export_transcripts(
+            run_dir, dest, max_output=args.max_output, jsonl=args.jsonl
+        )
+        total += len(ids)
+        print(f"[kernelthing] {len(ids)} member(s) -> {dest}", file=sys.stderr)
+    if not total:
+        print("[kernelthing] no members found (run had no agents yet?)", file=sys.stderr)
+    return 0
+
+
+def _problem_name(run_dir: Path) -> str:
+    """Problem name from run.json, falling back to the layout (<problem>/.humanize/…)."""
+    try:
+        meta = json.loads((run_dir / journal.RUN_JSON).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        meta = None
+    if isinstance(meta, dict):
+        name = (meta.get("problem") or {}).get("name")
+        if name:
+            return str(name)
+    return run_dir.parts[-4] if len(run_dir.parts) >= 4 else "run"
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "score":
@@ -331,6 +458,8 @@ def main(argv: list[str] | None = None) -> int:
         return web_command(argv[1:])
     if argv and argv[0] == "archive":
         return archive_command(argv[1:])
+    if argv and argv[0] == "transcripts":
+        return transcripts_command(argv[1:])
 
     parser = argparse.ArgumentParser(
         prog="kernelthing",
@@ -344,7 +473,11 @@ def main(argv: list[str] | None = None) -> int:
         "                  finished) under --root; run `kernelthing web --help`\n"
         "  archive         copy run artifacts out of the disposable managed root\n"
         "                  into a durable archive; for runs that died before they\n"
-        "                  could archive themselves (a finished run does it itself)",
+        "                  could archive themselves (a finished run does it itself)\n"
+        "  transcripts     render every agent's full conversation (prompt, text,\n"
+        "                  reasoning, tool calls with complete I/O) to markdown;\n"
+        "                  archiving already does this, so this is for live runs\n"
+        "                  and re-renders",
     )
     parser.add_argument(
         "problem",

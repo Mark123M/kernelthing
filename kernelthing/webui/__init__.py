@@ -35,6 +35,10 @@ from urllib.parse import parse_qs, urlparse
 
 from .. import journal
 
+# The NDJSON fold lives in transcript.py (it describes opencode's wire format,
+# not HTTP); ``kernelthing transcripts`` renders the same parts to files.
+from ..transcript import clip, is_tool, tool_line
+
 _WEBUI_DIR = Path(__file__).resolve().parent
 
 # Member artifacts a client may fetch verbatim; "transcript" is the structured
@@ -63,43 +67,6 @@ def tail_text(path: Path, nbytes: int = 262144) -> str:
     if size > nbytes and "\n" in txt:
         txt = txt.split("\n", 1)[1]
     return txt
-
-
-def tool_line(part: dict[str, Any]) -> str:
-    """One readable line for a tool event: name + its salient argument.
-
-    opencode nests the call args under ``part.state.input`` (e.g. a read tool is
-    ``{"tool":"read","state":{"input":{"filePath":...}}}``); only some shapes put
-    them at ``part.input``. Check both, else the line is just the bare tool name."""
-    name = part.get("tool") or part.get("name", "tool")
-    state = part["state"] if isinstance(part.get("state"), dict) else {}
-    inp = (
-        state["input"]
-        if isinstance(state.get("input"), dict)
-        else (part["input"] if isinstance(part.get("input"), dict) else {})
-    )
-    arg = ""
-    for key in (
-        "command",
-        "filePath",
-        "file_path",
-        "path",
-        "pattern",
-        "url",
-        "query",
-        "description",
-        "prompt",
-    ):
-        if inp.get(key):
-            arg = inp[key]
-            break
-    return " ".join((str(name) + " " + str(arg)).split())
-
-
-def is_tool(d: dict[str, Any], part: dict[str, Any]) -> bool:
-    return d["type"] in ("tool", "tool_use") or (
-        "type" in part and part["type"] in ("tool", "tool-invocation")
-    )
 
 
 def summarize_agent_log(path: Path) -> dict[str, Any]:
@@ -133,14 +100,6 @@ def summarize_agent_log(path: Path) -> dict[str, Any]:
                 out["cost"] += float(part["cost"] or 0.0)
     out["cost"] = round(float(out["cost"] or 0.0), 4)
     return out
-
-
-def clip(text: str, head: int = 16000, tail: int = 8000) -> str:
-    """Clip huge tool output, keeping head and tail (errors usually sit at the end)."""
-    if len(text) <= head + tail + 64:
-        return text
-    omitted = len(text) - head - tail
-    return text[:head] + f"\n… [{omitted} chars omitted] …\n" + text[-tail:]
 
 
 def transcript_items(path: Path, lines: int = 8000) -> list[dict[str, Any]]:

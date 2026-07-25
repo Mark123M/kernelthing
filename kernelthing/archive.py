@@ -14,10 +14,12 @@ The layout deliberately mirrors the managed root -- ``<archive>/<problem>/
 .humanize/rlcr/<ts>/`` -- which makes an archive root a drop-in for
 ``kernelthing web --root``: ``journal.discover_runs`` globs
 ``<root>/*/.humanize/rlcr/*``, so archived runs replay exactly like live ones
-with no special-casing anywhere in the UI. Alongside the run dir go the two
-things the run dir does *not* contain: a git bundle of every member commit (the
-managed repo is rebuilt on the next run, taking those commits with it) and the
-winning kernel files.
+with no special-casing anywhere in the UI. Alongside the run dir go the things
+the run dir does *not* contain: a git bundle of every member commit (the managed
+repo is rebuilt on the next run, taking those commits with it), the winning
+kernel files, and ``transcripts/<ts>/`` -- the agents' NDJSON logs flattened to
+readable markdown (see transcript.py), so a finished run is legible without a
+server or a parser.
 
 Export is best-effort and never raises. A failed copy must not change a run's
 exit status, and the cache copy is still on disk to retry from -- see
@@ -34,11 +36,12 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from . import journal
+from . import journal, transcript
 
 # Subdirs of <archive>/<problem>/ that sit beside the mirrored .humanize tree.
 BUNDLES = "bundles"
 BEST = "best"
+TRANSCRIPTS = "transcripts"
 ARCHIVE_JSON = "archive.json"
 
 
@@ -99,6 +102,17 @@ def export_run(
         # erroring -- a crashed run gets exported again by `kernelthing archive`.
         shutil.copytree(run_dir, dest, dirs_exist_ok=True, symlinks=True)
 
+        # Rendered transcripts ride along with the copy: the NDJSON logs in the
+        # run dir are the record, but nobody reads a 750KB event stream by eye,
+        # and the moment to flatten them is while the run is fresh -- not months
+        # later when someone wants to know what an agent tried. Separately
+        # try/except'd: a malformed log must not cost the run its archive.
+        try:
+            written = transcript.export_transcripts(dest, base / TRANSCRIPTS / ts)
+        except Exception as e:
+            written = []
+            say(f"transcripts failed (ignored): {e!r}")
+
         bundled = False
         if repo is not None and (Path(repo) / ".git").exists():
             bundled = _bundle_repo(Path(repo), base / BUNDLES / f"{ts}.bundle")
@@ -141,6 +155,8 @@ def export_run(
         )
 
         extra = []
+        if written:
+            extra.append(f"{len(written)} transcript(s)")
         if bundled:
             extra.append("git bundle")
         if copied:
