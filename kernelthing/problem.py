@@ -96,10 +96,14 @@ def load_problem(path: str | Path) -> Problem:
 
 
 # Never copied from the source problem dir into the managed repo: build noise,
-# and the two artifact trees (a run's own record, and archives of past runs).
-# Copying those in would commit them to the initial commit, so every worktree
-# would then materialise every past run.
-NO_COPY = frozenset({"__pycache__", ".humanize", "runs", ".git"})
+# and the artifact trees (a run's own record, archives of past runs, and rendered
+# transcripts of past agents). Copying those in would commit them to the initial
+# commit, so every worktree would then materialise every past run -- and the
+# agent would be editing its kernel next to a verbatim log of what 25 previous
+# agents tried, which is context nobody chose to give it. This is a name filter,
+# not a gitignore consult: the copy happens before the managed repo exists, so a
+# .gitignore in the source dir does not gate it.
+NO_COPY = frozenset({"__pycache__", ".humanize", "runs", "transcripts", ".git"})
 
 # Kept across the managed repo's rebuild -- this is the run record (journal,
 # members, results). See kernelthing/archive.py for why losing it was expensive.

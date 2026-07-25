@@ -113,15 +113,22 @@ def test_preserved_artifacts_never_enter_the_index(tmp_path: Path) -> None:
 
 
 def test_source_side_archives_are_not_copied_into_the_managed_repo(tmp_path: Path) -> None:
-    """A `runs/` archive kept next to the problem must not be dragged into the
-    managed repo (and committed, and materialised in every worktree)."""
+    """A `runs/` or `transcripts/` tree kept next to the problem must not be
+    dragged into the managed repo (and committed, and materialised in every
+    worktree). Transcripts are worse than bulk: they would put a verbatim log of
+    what every past agent tried into the next agent's working dir. The filter is
+    by name, so a .gitignore in the source repo does not cover this."""
     manifest = make_source_problem(tmp_path)
     src = Path(manifest).parent
     (src / "runs" / "old").mkdir(parents=True)
     (src / "runs" / "old" / "big.ndjson").write_text("x" * 1000, encoding="utf-8")
+    (src / "transcripts" / "2026-01-01").mkdir(parents=True)
+    (src / "transcripts" / "2026-01-01" / "member-0.md").write_text("secret", encoding="utf-8")
+    (src / ".gitignore").write_text("runs/\ntranscripts/\n", encoding="utf-8")
 
     prepared = prepare_problem(load_problem(manifest), tmp_path / "managed")
     assert not (prepared.repo_root / "runs").exists()
+    assert not (prepared.repo_root / "transcripts").exists()
 
 
 # --- export ------------------------------------------------------------------
