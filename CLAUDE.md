@@ -210,9 +210,11 @@ Consequences worth knowing before editing it:
   and the orchestrator then scores the commit it produced, usually byte-identical — the cache
   roughly halves a run's remote traffic. `KERNELTHING_POPCORN_CACHE` relocates it,
   `KERNELTHING_POPCORN_BIN` overrides the binary (tests point it at a stub).
-- The agent gets a different tool prompt (`prompts/claude/kernel-tools-popcorn-ncu.md` instead of
-  `kernel-tools-ncu.md`, and no shared-GPU block) — see `Orchestrator._kernel_tools_block`.
-  Profiling is `popcorn submit --profile-brev`, not local `ncu`.
+- The agent's tool prompt is `prompts/claude/kernel-tools-popcorn-ncu.md` — see
+  `Orchestrator._kernel_tools_block`, which returns `""` for a problem with no popcorn config
+  (such a problem cannot be scored at all, so there is nothing to tell it). The local-GPU variant
+  (`kernel-tools-ncu.md`) and the shared-GPU arbitration notice described the removed local
+  benchmark stack and are deleted. Profiling is `popcorn submit --profile-brev`, not local `ncu`.
 
 ### Problem contract (`problem.py`, `bench.py`, `prompts/claude/bootstrap-problem.md`)
 
@@ -259,17 +261,22 @@ bwrap with `--ro-bind / /`, then specific paths rebound writable: the worktree, 
 is the only reason `opencode --auto` is safe here. User skill dirs (`~/.claude/skills`,
 `~/.agents/skills`) are masked with tmpfs so no user-level skills leak into the agent's prompt.
 
-### Prompts: most of `prompts/` is dead legacy
+### Prompts: the tree is now exactly the working set
 
-kernelthing began as a port of Humanize, and `prompts/` still carries that tree. Only these are live:
+kernelthing began as a port of Humanize and `prompts/` used to carry that whole tree — 50 of its 75
+files were unreferenced (all of `codex/`, `plan/`, `idea/`, 16 of 21 `claude/`, 25 of 45 `block/`).
+They are deleted. What remains is loaded, and `prompts/codex/`, `prompts/plan/` and `prompts/idea/`
+no longer exist:
 
 - `prompts/claude/bootstrap-problem.md`, `bootstrap-mode-{auto,interactive}.md` — loaded by
   `bootstrap.py`.
-- `prompts/claude/kernel-tools-{wiki,ncu}.md` — loaded by `Orchestrator._kernel_tools_block`.
-- `prompts/block/*.md` — rendered by `guard_core.js`, but only 20 of the 45 are referenced.
-- Everything under `prompts/codex/`, `prompts/plan/`, `prompts/idea/`, and the rest of
-  `prompts/claude/` is unreferenced (one exception: `test_prompts.py` asserts
-  `codex/regular-review.md` exists).
+- `prompts/claude/kernel-tools-{wiki,popcorn-ncu}.md` — loaded by `Orchestrator._kernel_tools_block`.
+- `prompts/block/*.md` (20) — rendered by `guard_core.js`, one per `block(cfg, "<name>", ...)` call.
+  `render()` falls back to the inline message when a file is missing, so a stale name degrades
+  quietly; that is also why an unreferenced template is invisible until you go looking.
+
+When adding a prompt file, wire it in the same commit — an unreferenced one is indistinguishable
+from legacy a month later.
 
 The **operator prompts that actually drive the search are inline constants** in `orchestrator.py`
 (`EVOLVE_EXPLORE_PROMPT`, `EVOLVE_EXPLOIT_PROMPT`, `EVOLVE_DESCRIPTOR_FOOTER`, `METHODOLOGY_PROMPT`).

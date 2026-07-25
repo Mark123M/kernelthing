@@ -272,88 +272,55 @@ class Orchestrator:
         Cached: every input (cfg flags, ``sys.executable``, ``REPO_ROOT``) is
         fixed for the run, so the block is built once instead of per candidate.
 
-        A remotely-scored (popcorn) problem gets a different tool story entirely: no
-        local card to arbitrate, so the shared-GPU section is dropped, and profiling
-        goes through the hosted Nsight Compute service rather than a local ``ncu``.
+        Scoring is remote-only: ``cli.score_command`` hard-errors on a problem
+        without the popcorn backend, so a problem that has no popcorn config
+        cannot be scored and there is no other tool story to tell it. The local
+        story this used to carry (a shared-GPU arbitration notice, a local ``ncu``
+        recipe) described a benchmark stack that no longer exists.
         """
         from . import popcorn
         from .config import REPO_ROOT
 
+        pop = popcorn.config_or_none(self.problem)
+        if pop is None:
+            return ""
+
         parts: list[str] = []
         pyexe = sys.executable or "python3"
-        pop = popcorn.config_or_none(self.problem)
-        if pop is not None:
-            wiki_dir = REPO_ROOT / "vendor" / "KernelWiki"
-            ncu_dir = REPO_ROOT / "vendor" / "ncu-report-skill"
-            if self.cfg.wiki and _vendored(wiki_dir):
-                parts.append(
-                    prompts.load_and_render_safe(
-                        "claude/kernel-tools-wiki.md",
-                        "",
-                        PYTHON=pyexe,
-                        WIKI_DIR=str(wiki_dir),
-                    )
-                )
-            if self.cfg.ncu:
-                # The skill is a git submodule and is routinely uninitialised; pointing an
-                # agent at a SKILL.md that is not there just burns a turn. The profiling
-                # workflow itself does not depend on it, so only the pointer is dropped.
-                skill_note = (
-                    "\nFor deeper interpretation — the six analysis dimensions and a "
-                    f"signal→cause→fix playbook — read `{ncu_dir}/SKILL.md`, then its "
-                    "`reference/` docs as needed.\n"
-                    if _vendored(ncu_dir)
-                    else ""
-                )
-                parts.append(
-                    prompts.load_and_render_safe(
-                        "claude/kernel-tools-popcorn-ncu.md",
-                        "",
-                        PYTHON=pyexe,
-                        NCU_SKILL_NOTE=skill_note,
-                        POPCORN_BIN=popcorn.popcorn_bin(pop) or "popcorn",
-                        PROFILER_URL=popcorn.brev_profiler_url(),
-                        LEADERBOARD=pop.leaderboard,
-                        BENCHMARK_INDEX=pop.benchmark_index,
-                        SUBMISSION_FILE=pop.submission_file,
-                        SCORE_CMD=self._score_cmd_str(),
-                    )
-                )
-            return self._tools_section(parts)
-        if self.cfg.sandbox:
-            parts.append(
-                "### Shared GPU — allocation is automatic\n\n"
-                "You share a pool of GPUs with other agents and the scorer, and "
-                "concurrent use of one card corrupts timings and can OOM. This is "
-                "handled for you: just run your benchmark, `ncu`, or `nsys` "
-                "normally — the harness transparently assigns your process a free "
-                "GPU and holds it for that process's lifetime. **Do not** set "
-                "`CUDA_VISIBLE_DEVICES` yourself; it is managed for you and "
-                "overriding it will not give you a different card.\n\n"
-                "If every GPU is busy, your process pauses at its first CUDA call "
-                "until one frees — this is normal queuing, not a hang. Do not run "
-                "`nvidia-smi` or `ps` to debug it; the command proceeds on its own. "
-                "Use the wait time to plan or read."
-            )
-        if self.cfg.wiki:
+        wiki_dir = REPO_ROOT / "vendor" / "KernelWiki"
+        ncu_dir = REPO_ROOT / "vendor" / "ncu-report-skill"
+        if self.cfg.wiki and _vendored(wiki_dir):
             parts.append(
                 prompts.load_and_render_safe(
                     "claude/kernel-tools-wiki.md",
                     "",
                     PYTHON=pyexe,
-                    WIKI_DIR=str(REPO_ROOT / "vendor" / "KernelWiki"),
+                    WIKI_DIR=str(wiki_dir),
                 )
             )
         if self.cfg.ncu:
-            ncu_pp = sorted((Path("/opt/nvidia/nsight-compute")).glob("*/extras/python"))
+            # The skill is a git submodule and is routinely uninitialised; pointing an
+            # agent at a SKILL.md that is not there just burns a turn. The profiling
+            # workflow itself does not depend on it, so only the pointer is dropped.
+            skill_note = (
+                "\nFor deeper interpretation — the six analysis dimensions and a "
+                f"signal→cause→fix playbook — read `{ncu_dir}/SKILL.md`, then its "
+                "`reference/` docs as needed.\n"
+                if _vendored(ncu_dir)
+                else ""
+            )
             parts.append(
                 prompts.load_and_render_safe(
-                    "claude/kernel-tools-ncu.md",
+                    "claude/kernel-tools-popcorn-ncu.md",
                     "",
                     PYTHON=pyexe,
-                    NCU_DIR=str(REPO_ROOT / "vendor" / "ncu-report-skill"),
-                    NCU_BIN=shutil.which("ncu") or "/usr/local/cuda/bin/ncu",
-                    NCU_PYTHONPATH=str(ncu_pp[-1]) if ncu_pp else "",
+                    NCU_SKILL_NOTE=skill_note,
+                    POPCORN_BIN=popcorn.popcorn_bin(pop) or "popcorn",
+                    PROFILER_URL=popcorn.brev_profiler_url(),
+                    LEADERBOARD=pop.leaderboard,
+                    BENCHMARK_INDEX=pop.benchmark_index,
+                    SUBMISSION_FILE=pop.submission_file,
+                    SCORE_CMD=self._score_cmd_str(),
                 )
             )
         return self._tools_section(parts)

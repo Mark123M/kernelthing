@@ -29,15 +29,3 @@ def test_kernelguard_missing_file_fails_open(tmp_path):
     assert gates.kernelguard_violations(["nope.py"], tmp_path) == []
 
 
-def test_format_kernelguard_violations():
-    items = [
-        {
-            "file": "k.py",
-            "classification": "hacked",
-            "reason": "high_critical",
-            "patterns": ["TIMER_MONKEYPATCH"],
-        }
-    ]
-    out = gates.format_kernelguard_violations(items)
-    assert "k.py [hacked]: high_critical" in out
-    assert "TIMER_MONKEYPATCH" in out

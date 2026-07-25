@@ -96,10 +96,3 @@ def kernelguard_violations(
     return out
 
 
-def format_kernelguard_violations(items: list[dict[str, Any]]) -> str:
-    """Render the ``{{VIOLATIONS}}`` body for block/kernelguard-cheat.md."""
-    blocks = []
-    for it in items:
-        pats = ", ".join(it["patterns"]) or "(unnamed rules)"
-        blocks.append(f"- {it['file']} [{it['classification']}]: {it['reason']}\n    rules: {pats}")
-    return "\n".join(blocks)

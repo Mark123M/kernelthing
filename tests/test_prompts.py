@@ -17,12 +17,14 @@ def test_basic_substitution():
 
 
 def test_load_real_prompt_renders_placeholders():
-    # regular-review.md should exist in the working set and accept CURRENT_ROUND.
-    text = prompts.load("codex/regular-review.md")
-    assert text, "regular-review.md should be present"
-    rendered = prompts.render(text, CURRENT_ROUND=7)
-    assert "Round 7" in rendered
-    assert "{{CURRENT_ROUND}}" not in rendered
+    # A live prompt loads and substitutes. kernel-tools-wiki.md is one the
+    # orchestrator actually renders -- the fixture is deliberately not a
+    # legacy file, so this test dies with the feature rather than outliving it.
+    text = prompts.load("claude/kernel-tools-wiki.md")
+    assert text, "kernel-tools-wiki.md should be present"
+    rendered = prompts.render(text, PYTHON="/usr/bin/python3", WIKI_DIR="/vendor/KernelWiki")
+    assert "/vendor/KernelWiki/scripts/query.py" in rendered
+    assert "{{WIKI_DIR}}" not in rendered
 
 
 def test_working_set_has_no_role_word_claude():
