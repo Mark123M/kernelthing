@@ -156,6 +156,38 @@ def _vendored(path: Path) -> bool:
     return path.is_dir() and any(path.iterdir())
 
 
+# Nsight Compute ships ``ncu_report`` as a plain module under its install tree, not on
+# PyPI -- ``pip install ncu_report`` does not exist. The vendored ncu-report-skill's
+# helpers/ all import it, so without this the whole helper toolchain is dead the moment
+# an agent follows SKILL.md. The sandbox ro-binds / so the path resolves from any
+# worktree; we only have to tell the agent which one.
+_NSIGHT_PYTHON_GLOBS = (
+    "/opt/nvidia/nsight-compute/*/extras/python",
+    "/usr/local/cuda*/nsight-compute*/extras/python",
+    "/usr/local/NVIDIA-Nsight-Compute*/extras/python",
+)
+
+
+def _ncu_report_pythonpath() -> str:
+    """Newest Nsight Compute ``extras/python`` dir holding ncu_report, or ''.
+
+    Returns '' when Nsight Compute is not installed -- like every other gate here
+    that degrades rather than raises, a missing profiler just drops the note.
+    """
+    found: list[Path] = []
+    for pattern in _NSIGHT_PYTHON_GLOBS:
+        try:
+            found += [
+                p for p in Path("/").glob(pattern.lstrip("/")) if (p / "ncu_report.py").is_file()
+            ]
+        except OSError:
+            continue
+    if not found:
+        return ""
+    # Version dirs sort lexically well enough (2025.4.0 < 2025.4.1); take the newest.
+    return str(sorted(found)[-1])
+
+
 class Orchestrator:
     def __init__(self, problem: Problem, cfg: Config):
         self.problem = problem
@@ -250,6 +282,53 @@ class Orchestrator:
             return self.problem.score_command
         return f"{kt} score ."
 
+    def _preflight(self) -> None:
+        """Fail loudly on a scoring command the agents cannot actually run.
+
+        Every agent gets ``sys.executable``'s sibling ``kernelthing`` baked into its
+        prompt as the scoring command. Moving or renaming the checkout while its venv
+        is active breaks that script without breaking *us*: the parent process already
+        resolved its interpreter at import, so the loop starts happily and hands all N
+        agents a command that dies. The failure is silent and total -- every candidate
+        burns a turn discovering it cannot score, and the run produces nothing.
+
+        Existence is not enough to check. A console script left behind by a renamed
+        checkout still exists; it is its ``#!`` line that dangles, and the kernel
+        reports that as ENOENT *on the script*. So actually execute it. One ~0.3s
+        subprocess at setup buys certainty about the string every agent will run.
+        """
+        if self.problem.score_command:
+            return  # the problem owns its own command; not ours to validate
+        kt = Path(sys.executable).parent / "kernelthing"
+        hint = (
+            f"\n  sys.executable = {sys.executable}"
+            "\nThis usually means the checkout was renamed or moved while a venv from the "
+            "old path was still active, leaving the console script's #! line dangling. "
+            "Re-activate and reinstall:"
+            "\n  deactivate; source .venv/bin/activate; pip install -e '.[dev]'"
+        )
+        try:
+            proc = subprocess.run(
+                [str(kt), "--help"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except OSError as e:
+            # ENOENT here means either the script or its interpreter is missing.
+            raise RuntimeError(
+                f"scoring command is not runnable -- every agent would be handed a dead "
+                f"path.\n  {kt}: {e}{hint}"
+            ) from e
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"scoring command hung on --help: {kt}{hint}") from e
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"scoring command exits {proc.returncode} on --help -- every agent would "
+                f"be handed a broken command.\n  {kt}\n"
+                f"{(proc.stderr or proc.stdout).strip()[:500]}{hint}"
+            )
+
     def _prompt_common(self, state: State) -> dict[str, Any]:
         """Template fields shared by every operator prompt + the descriptor footer."""
 
@@ -279,7 +358,7 @@ class Orchestrator:
         recipe) described a benchmark stack that no longer exists.
         """
         from . import popcorn
-        from .config import REPO_ROOT
+        from .config import REPO_ROOT, veloq_python
 
         pop = popcorn.config_or_none(self.problem)
         if pop is None:
@@ -302,13 +381,30 @@ class Orchestrator:
             # The skill is a git submodule and is routinely uninitialised; pointing an
             # agent at a SKILL.md that is not there just burns a turn. The profiling
             # workflow itself does not depend on it, so only the pointer is dropped.
-            skill_note = (
-                "\nFor deeper interpretation — the six analysis dimensions and a "
-                f"signal→cause→fix playbook — read `{ncu_dir}/SKILL.md`, then its "
-                "`reference/` docs as needed.\n"
-                if _vendored(ncu_dir)
-                else ""
-            )
+            #
+            # SKILL.md's links are all relative and its workflow assumes a local GPU
+            # (build a .cu harness, run ncu, parse with ncu_report) -- neither is true
+            # here, so the pointer has to say so or the agent follows it off a cliff.
+            skill_note = ""
+            if _vendored(ncu_dir):
+                nsight = _ncu_report_pythonpath()
+                helper_note = (
+                    f"Its `helpers/*.py` need `PYTHONPATH={nsight}` "
+                    "(`ncu_report` ships with Nsight Compute, not pip), and they only add "
+                    "value over `ncu-details.txt` for per-line stall attribution.\n"
+                    if nsight
+                    else "Skip its `helpers/*.py`: they import `ncu_report`, which is not "
+                    "installed here.\n"
+                )
+                ref = f"{ncu_dir}/reference"
+                skill_note = (
+                    "\nFor deeper interpretation — the six analysis dimensions and a "
+                    f"signal→cause→fix playbook — read `{ref}/05-analysis-dimensions.md` "
+                    f"and `{ref}/06-diagnosis-playbook.md`.\n"
+                    f"Every link inside those files is relative: resolve it against "
+                    f"`{ncu_dir}/`. Ignore `{ncu_dir}/SKILL.md`'s collection workflow — it "
+                    "assumes a local GPU, and yours is remote.\n" + helper_note
+                )
             parts.append(
                 prompts.load_and_render_safe(
                     "claude/kernel-tools-popcorn-ncu.md",
@@ -323,7 +419,61 @@ class Orchestrator:
                     SCORE_CMD=self._score_cmd_str(),
                 )
             )
+        # veloq turns the .ncu-rep the profiler already downloads into structured
+        # evidence. Gated on the binary *and* its bundled reader: the Nsight installed
+        # here is too old to open a capture from the hosted profiler (see
+        # config.veloq_python), so without the venv the block would only mislead.
+        veloq_bin = shutil.which("veloq")
+        if self.cfg.veloq and veloq_bin and veloq_python():
+            ptx_dir = REPO_ROOT / "vendor" / "ptx-skill"
+            veloq_skill = REPO_ROOT / "vendor" / "veloq-ncu-skill"
+            parts.append(
+                prompts.load_and_render_safe(
+                    "claude/kernel-tools-veloq.md",
+                    "",
+                    VELOQ_BIN=veloq_bin,
+                    SUBMISSION_FILE=pop.submission_file,
+                    PTX_NOTE=self._ptx_note(ptx_dir),
+                    VELOQ_REF_NOTE=self._veloq_ref_note(veloq_skill),
+                )
+            )
         return self._tools_section(parts)
+
+    def _ptx_note(self, ptx_dir: Path) -> str:
+        """Pointer to the vendored PTX/CUDA reference tree, or '' when absent.
+
+        The caveat leads deliberately. This skill's own workflow is local -- it opens
+        with compute-sanitizer, cuda-gdb and ``nvcc -g -G`` -- and those binaries *are*
+        installed on this box and will happily run against whatever consumer GPU it has,
+        at the wrong architecture, returning numbers that look real. Naming the two files
+        worth reading beats pointing at SKILL.md: of the other vendored skill, only 3 of
+        25 members ever opened it and none ran a helper.
+        """
+        if not (self.cfg.ptx and _vendored(ptx_dir)):
+            return ""
+        return (
+            f"\nTo decode an unfamiliar instruction in that disassembly, "
+            f"`{ptx_dir}/references/ptx-isa.md` and `{ptx_dir}/references/ptx-docs/` are "
+            f"the ISA reference, and `{ptx_dir}/references/performance-traps.md` collects "
+            "the usual pitfalls. Relative links inside resolve against "
+            f"`{ptx_dir}/`.\nThat tree is a **reference, not a workflow**: ignore every "
+            "part of it that builds, runs, debugs or profiles a kernel locally "
+            "(compute-sanitizer, cuda-gdb, nvcc, local ncu/nsys). Those tools exist here "
+            "and will run, but not on the B200 you are optimizing, so any number they "
+            "produce is noise.\n"
+        )
+
+    @staticmethod
+    def _veloq_ref_note(skill_dir: Path) -> str:
+        """Pointer to the vendored veloq analysis reference, or '' when absent."""
+        if not _vendored(skill_dir):
+            return ""
+        ref = f"{skill_dir}/references"
+        return (
+            f"\nFor turning those numbers into a diagnosis, `{ref}/analysis-dimensions.md` "
+            f"and `{ref}/diagnosis-reference.md` map signal → cause → fix; "
+            f"`{ref}/limitations.md` lists what the counters cannot tell you.\n"
+        )
 
     @staticmethod
     def _tools_section(parts: list[str]) -> str:
@@ -337,6 +487,7 @@ class Orchestrator:
 
     # --- setup ---
     def setup(self) -> tuple[State, LoopDirs]:
+        self._preflight()
         if not (self.wd / self.problem.plan).is_file():
             raise FileNotFoundError(f"plan not found: {self.wd / self.problem.plan}")
         if gates.git(["rev-parse", "--git-dir"], self.wd).returncode != 0:
@@ -429,6 +580,7 @@ class Orchestrator:
             log_path=log_path,
             err_path=Path(str(log_path) + ".stderr"),
             guard=guard,
+            mcp_cuda_docs=self.cfg.mcp_cuda_docs,
         )
         if res.session_id:
             self.impl_session = res.session_id
@@ -589,6 +741,7 @@ class Orchestrator:
                 data_dir=wt / ".humanize" / "oc-data",
                 extra_writable=[self.wd / ".git"],
                 guard=guard,
+                mcp_cuda_docs=self.cfg.mcp_cuda_docs,
             )
             m.agent_s = round(time.time() - t0, 1)
             m.cost = res.cost

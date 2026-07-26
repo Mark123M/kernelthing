@@ -339,8 +339,12 @@ output_t = torch.Tensor
 
 ```
 # Nsight Compute captures downloaded by `popcorn submit --profile-brev`. Candidates
-# commit with `git add -A`, and these are large.
+# commit with `git add -A`, and these are large. popcorn extracts relative to the
+# process cwd, not to --output, so the capture dir lands wherever the agent ran it and
+# is named `profile.<index>-<spec-slug>/` -- a bare `profile/` misses ncu-details.csv
+# and ncu-details.txt inside it.
 profile/
+profile.*/
 *.ncu-rep
 *.zip
 runs/

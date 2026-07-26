@@ -40,6 +40,15 @@ is a gitlink with no `.gitmodules` entry. Scope it instead:
 pure Python. `pip install -e '.[dev]'` needs no C compiler, CUDA, or torch. Scoring is remote, so the
 only hard deps are `kernelguard` and `PyYAML`; the `popcorn` CLI is an external prerequisite.
 
+**Never move or rename the checkout with its venv active.** Every agent is handed
+`sys.executable`'s sibling `kernelthing` as its scoring command (`_score_cmd_str`). A stale `PATH`
+entry still yields a working *parent* process — the entry-point shebang resolved once, at import —
+while handing all N agents a path that no longer exists, so every candidate burns a full turn
+discovering it cannot score and the run produces nothing. This actually happened
+(`projects/kernelthing` → `projects/linalgkernelthing`). `Orchestrator._preflight`, called first
+thing in `setup()`, now hard-fails on it; the fix is
+`deactivate; source .venv/bin/activate; pip install -e '.[dev]'`.
+
 ### Test-environment realities
 
 Tests never need a GPU, `opencode`, or the popcorn service (the network path is not exercised):
@@ -48,9 +57,19 @@ Tests never need a GPU, `opencode`, or the popcorn service (the network path is 
   (both channels: `*.txt` `--output` files and `api-*.json` API responses) — no network.
 - `test_bootstrap.py` fakes `opencode_client.run`; `validate_problem` is structural-only, so there is
   no runtime score to stub.
-- `test_oc_guard.py` shells to `node tests/guard_driver.mjs` (skipped without node).
+- `test_oc_guard.py` shells to a JS runtime via `tests/guard_driver.mjs` (`node`, `nodejs`, `bun`,
+  `deno`, or `$KERNELTHING_NODE`). **Install one** — `sudo apt install nodejs`. At *runtime* the
+  guard needs no system runtime at all (opencode loads the plugin with its own embedded one), so a
+  box without node runs the guard correctly and silently loses all 49 of its tests. That asymmetry
+  is how a broken guard ships; the skip message names the fix for the same reason. A full suite is
+  **198 passed, 0 skipped**; any skip count at all means a prerequisite is missing, not that some
+  tests are conditional — check the `-rs` reasons before trusting a green run.
 - `test_prompts.py::test_working_set_has_no_role_word_claude` scans **every** `prompts/**/*.md` for
   the literal string "Claude" and fails if found. Adding a prompt file that mentions it breaks CI.
+- `test_harness_deps.py` covers the prerequisites that fail *silently in a run* rather than loudly
+  at startup — the interpreter preflight, `ncu_report` discovery, and whether each problem's
+  `.gitignore` actually matches the capture layout popcorn produces. Every case in it is a real
+  failure recovered from a run's artifacts, not a hypothetical.
 
 ## Architecture
 
@@ -215,6 +234,102 @@ Consequences worth knowing before editing it:
   (such a problem cannot be scored at all, so there is nothing to tell it). The local-GPU variant
   (`kernel-tools-ncu.md`) and the shared-GPU arbitration notice described the removed local
   benchmark stack and are deleted. Profiling is `popcorn submit --profile-brev`, not local `ncu`.
+- **`popcorn` extracts captures relative to its own cwd, not to `--output`.** Passing
+  `--output profile/brev.json` from the worktree root puts `brev.json` under `profile/` but drops
+  `profile.<index>-<spec-slug>/` at the *root*. Hence two ignore rules per problem (`profile/` **and**
+  `profile.*/`) — the bare `profile/` left `ncu-details.{csv,txt}` committable. The prompt therefore
+  tells agents to run it from the root with `--output brev.json` and no `cd`; it also warns that
+  opencode validates the bash tool's `workdir` *before* running the command, so the natural
+  `mkdir -p profile` + `workdir: profile` yields `NotFound: FileSystem.access` (it cost three
+  members two turns each in the 2026-07-24 run).
+- **`ncu_report` ships inside Nsight Compute, not on PyPI** — `pip install ncu_report` does not
+  exist. Every `helpers/*.py` in `vendor/ncu-report-skill` imports it, so the whole helper toolchain
+  is dead unless the prompt names the path. `_ncu_report_pythonpath()` globs the install tree
+  (`/opt/nvidia/nsight-compute/*/extras/python`, the CUDA-bundled locations) and the skill note
+  passes it through as a `PYTHONPATH=`; it returns `""` and drops the note when Nsight is absent,
+  failing open like every other gate. The note also tells agents to resolve the skill's relative
+  links against the vendor dir and to ignore its local-GPU collection workflow — `SKILL.md` step 4
+  ("parse with `ncu_report`, not by eye-balling the CLI") contradicts this prompt, which says to
+  `cat ncu-details.txt`. The prompt wins; only 3 of 25 members ever opened `SKILL.md` and none ran a
+  helper.
+- **Installing a newer Nsight does not make it the one in use** — both that glob and `ncu` itself
+  can keep silently resolving the old build. The `.run` installer defaults to
+  `/usr/local/NVIDIA-Nsight-Compute-<ver>/`, which matches neither glob shape. And
+  `/usr/local/cuda-*/bin/ncu` is not the profiler: it is a CUDA-toolkit sh dispatcher that scans the
+  same two shapes (`/opt/nvidia/nsight-compute/*`, `$CUDA_BIN/../nsight-compute-*`), picks the
+  highest version found, and `exec`s it. Neither path errors — `ncu --version` just keeps reporting
+  the old build and `_ncu_report_pythonpath()` keeps handing agents the old `ncu_report`.
+  Symlinking the install into the scanned dir fixes both at once:
+  `sudo ln -s /usr/local/NVIDIA-Nsight-Compute-2026.2 /opt/nvidia/nsight-compute/2026.2.1`.
+  Name the link with **three** version fields — the dispatcher splits the basename on `.` and
+  computes `$(( year*10000 + major*100 + minor ))`; a missing third field makes that arithmetic
+  expansion an error. Verify with `ncu --version` *and*
+  `python -c "from kernelthing.orchestrator import _ncu_report_pythonpath as p; print(p())"`,
+  since the two resolve independently.
+- **`nvcc`/`ncu`/`nsys`/`nvidia-smi` may be installed and will happily run** — on whatever consumer
+  GPU the dev box has, at a different architecture from the B200 being optimised. Nothing in
+  `guard_core.js` blocks them (`gpu-tamper` only catches `CUDA_VISIBLE_DEVICES`/`LD_PRELOAD`/
+  `KERNELTHING_*`), so the prompt has to call them a trap explicitly rather than merely omitting
+  them. `torch`/`numpy` are deliberately absent, which is why agents that try a local sanity check
+  hit `ModuleNotFoundError` instead of a wrong answer — a good failure, worth keeping.
+
+### Reading the capture: `veloq`, and the version trap (`config.veloq_python`)
+
+`--profile-brev` downloads a `profile.ncu-rep` alongside `ncu-details.txt`. The text file is
+a rounded rendering; the report holds the same capture structured — per-launch metrics, the
+profiler's rule findings with severities and `focus_metrics`, and per-source-line warp-stall
+histograms. `veloq ncu <verb>` reads it, **on this box, with no GPU** — it is a file parser.
+`prompts/claude/kernel-tools-veloq.md` teaches the verbs inline (measured on a real capture:
+9 launches, 108 rule findings, 22509 metrics).
+
+Two things make this fragile enough to be worth the note:
+
+- **The bundled reader is mandatory, not preferred.** The hosted profiler emits Nsight
+  Compute **2026.2** captures, and the reader must match. A too-old reader fails *every* verb,
+  not just the warp-stall one — it dies building the sidecar with
+  `'IAction' object has no attribute 'timed_warp_samples'`, which is what a 2025.4.1 `ncu_report`
+  did here before 2026.2.1 was installed alongside it. So `config.veloq_python()` resolves veloq's
+  own venv (`<xdg-data>/veloq/ncu-report-*/`) and the block is dropped when that is absent.
+  **There is no fallback to `_ncu_report_pythonpath()`; do not add one** — and the fact that the
+  system Nsight currently *does* match is not a reason to add one. The two versions float
+  independently: the hosted profiler upgrades on gpu-mode's schedule and the local Nsight is a
+  hand-installed tarball, so they agree only by coincidence and only until either moves. veloq's
+  venv is version-pinned to the reader it needs; a fallback would silently swap in a mismatched
+  one and turn a dropped prompt block into 108 rule findings of garbage.
+- **The pin exists because of the XDG repoint.** `build_opencode_env` gives each candidate an
+  isolated `XDG_DATA_HOME`, which is exactly where veloq looks for that venv — so under the
+  sandbox it would vanish. `VELOQ_PYTHON` is pinned to the absolute path (bwrap ro-binds `/`,
+  so it resolves from any worktree). It is a `setdefault`: an operator's exported value wins.
+  `test_veloq_env_pin_survives_the_per_candidate_xdg_repoint` clears the var first for exactly
+  that reason — a developer with it exported would otherwise be testing their own shell.
+
+`<report>.veloq/` sidecars are written next to the report, so `profile.*/` already ignores them.
+
+### Skills are vendored, never loaded (`sandbox.SKILL_HOMES`)
+
+`~/.claude/skills` and `~/.agents/skills` are tmpfs-masked, and that is where the useful ones
+actually live. So they are copied into `vendor/` and surfaced as **paths in the prompt**:
+`vendor/veloq-ncu-skill` (the veloq analysis references) and `vendor/ptx-skill` (PTX/CUDA ISA).
+Both are plain copies, not submodules — `git submodule update --init` is broken repo-wide.
+
+Point at **named files, never a `SKILL.md`**: of `vendor/ncu-report-skill`, only 3 of 25 members
+ever opened it and none ran a helper. `_ptx_note` / `_veloq_ref_note` follow that rule.
+
+`_ptx_note` leads with a caveat rather than the paths, and it is load-bearing: that skill opens
+with `compute-sanitizer`, `cuda-gdb` and `nvcc -g -G`, and those binaries **are installed here
+and will run** — on a consumer GPU at the wrong architecture, returning numbers that look real.
+
+### CUDA-docs MCP (`opencode_client.CUDA_DOCS_MCP_URL`)
+
+Declared in the generated opencode config, on by default (`cfg.mcp_cuda_docs`, `--no-cuda-docs`).
+opencode's schema is `McpRemoteConfig` — `type: "remote"`, **not** the `"http"` that the
+`.claude.json` form uses; copying that shape across silently produces no tools.
+
+The server is OAuth-gated (401 + RFC 7591 dynamic registration), so it needs **a one-time
+interactive auth**: a sandboxed candidate has no browser and cannot do it. The token then rides
+in opencode's `auth.json`, which `_seed_auth_for_isolated_data` already copies per candidate.
+Until someone completes that flow, the declaration is inert — verified that a dead MCP endpoint
+leaves opencode's startup and exit path byte-identical to no MCP at all, so it fails open.
 
 ### Problem contract (`problem.py`, `bench.py`, `prompts/claude/bootstrap-problem.md`)
 

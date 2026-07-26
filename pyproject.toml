@@ -51,7 +51,7 @@ line-length = 100
 # (kernel code uses matrix-style names the N rules reject, and reformatting them would
 # diverge them from the source they were vendored from); popcorn-cli is a third-party
 # checkout kept for reference. mypy already excludes problems/ for the same reason.
-extend-exclude = ["problems/", "popcorn-cli/"]
+extend-exclude = ["problems/", "popcorn-cli/", "vendor/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "T20", "Q", "RUF", "SIM", "C4"]

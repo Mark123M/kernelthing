@@ -21,10 +21,14 @@ from pathlib import Path
 from typing import Any
 
 from . import sandbox
+from .config import veloq_python
 
 # The PreToolUse guard plugin and the block-message templates it renders.
 GUARD_PLUGIN = Path(__file__).resolve().parent / "oc_guard" / "guard.js"
 GUARD_BLOCK_DIR = Path(__file__).resolve().parent.parent / "prompts" / "block"
+
+# NVIDIA's hosted CUDA-docs MCP server (OAuth-gated; see build_opencode_env).
+CUDA_DOCS_MCP_URL = "https://api.copilot.nsight.ngc.nvidia.com/mcp/cuda-docs"
 
 
 def opencode_state_dirs() -> list[Path]:
@@ -151,18 +155,46 @@ def build_opencode_env(
     *,
     data_dir: Path | None = None,
     guard: dict[str, Any] | None = None,
+    mcp_cuda_docs: bool = False,
 ) -> tuple[dict[str, Any], list[Path]]:
     """Build the env dict and opencode state dirs shared by run/run_interactive.
 
     The agent inherits the parent environment verbatim (so the model API key and
     the ``POPCORN_*`` config for remote submit/profile propagate). Scoring is
     remote, so no GPU-lock shim is injected and no CUDA env is pinned.
+
+    ``mcp_cuda_docs`` declares NVIDIA's hosted CUDA-docs MCP server in the generated
+    opencode config. Defaults off so a bare call (tests, bootstrap) adds no network
+    dependency; the loop passes ``cfg.mcp_cuda_docs``.
     """
     env = dict(os.environ)
     home = Path(os.path.expanduser("~"))
     parent_xdg_data = Path(os.environ.get("XDG_DATA_HOME", home / ".local" / "share"))
 
+    # veloq reads .ncu-rep through a bundled ncu_report venv under the *real* XDG data
+    # dir. We repoint XDG_DATA_HOME below, which would hide it, so pin the absolute path
+    # (bwrap ro-binds /, so it resolves from any worktree). Resolve before the repoint.
+    veloq_py = veloq_python()
+    if veloq_py:
+        env.setdefault("VELOQ_PYTHON", veloq_py)
+
     oc_config: dict[str, Any] = {"snapshot": False}
+    if mcp_cuda_docs:
+        # NVIDIA's hosted CUDA documentation, as an MCP tool. opencode's schema is
+        # McpRemoteConfig -- `type: "remote"`, unlike the `"http"` the .claude.json
+        # form uses. The server is OAuth-gated (401 + RFC 7591 dynamic registration),
+        # so it only works once someone has completed the flow interactively; the token
+        # then rides along in auth.json, which _seed_auth_for_isolated_data copies. An
+        # unauthenticated or unreachable server must degrade to "no CUDA docs" rather
+        # than stall a candidate, hence the explicit timeout.
+        oc_config["mcp"] = {
+            "nvidia-cuda-docs": {
+                "type": "remote",
+                "url": CUDA_DOCS_MCP_URL,
+                "enabled": True,
+                "timeout": 15000,
+            }
+        }
     if guard is not None:
         guard_cfg = dict(guard)
         guard_cfg.setdefault("blockDir", str(GUARD_BLOCK_DIR))
@@ -243,6 +275,7 @@ def run(
     data_dir: Path | None = None,
     extra_writable: list[Path] | tuple[Path, ...] = (),
     guard: dict[str, Any] | None = None,
+    mcp_cuda_docs: bool = False,
 ) -> OpencodeResult:
     """Run one opencode turn and return the parsed result.
 
@@ -291,7 +324,9 @@ def run(
     # snapshots are pure overhead. The repo's opencode.json (snapshot:false) can't
     # reach the agent -- it runs in the per-worktree problem repo and we override
     # config via OPENCODE_CONFIG_CONTENT here -- so set it inline.
-    env, oc_state = build_opencode_env(data_dir=data_dir, guard=guard)
+    env, oc_state = build_opencode_env(
+        data_dir=data_dir, guard=guard, mcp_cuda_docs=mcp_cuda_docs
+    )
 
     argv = sandbox.wrap(
         inner,

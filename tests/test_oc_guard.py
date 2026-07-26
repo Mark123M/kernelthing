@@ -1,13 +1,19 @@
 """Exercise the opencode guard plugin's decide() against synthetic tool calls.
 
-guard.js is JS, so these tests shell out to ``node`` via tests/guard_driver.mjs.
-They are skipped if node is unavailable. The decision logic is the port of
+guard.js is JS, so these tests shell out to a JS runtime via tests/guard_driver.mjs.
+They are skipped if none is available. The decision logic is the port of
 Humanize's PreToolUse validators; see kernelthing/oc_guard/guard.js.
+
+At runtime the guard needs no system runtime at all -- opencode loads the plugin with
+its own embedded one -- so a box with no node still runs the guard correctly and only
+loses this coverage. That asymmetry hides a broken guard, so the skip names the fix.
+Set ``KERNELTHING_NODE`` to point at a runtime pytest cannot find on PATH.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -18,12 +24,32 @@ REPO = Path(__file__).resolve().parent.parent
 DRIVER = REPO / "tests" / "guard_driver.mjs"
 BLOCK_DIR = REPO / "prompts" / "block"
 
-pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+
+def _node_bin() -> str | None:
+    """First usable JS runtime: an explicit override, then the usual names."""
+    override = os.environ.get("KERNELTHING_NODE")
+    if override:
+        return override if Path(override).exists() or shutil.which(override) else None
+    for name in ("node", "nodejs", "bun", "deno"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+NODE = _node_bin()
+
+pytestmark = pytest.mark.skipif(
+    NODE is None,
+    reason="no JS runtime (node/nodejs/bun/deno) -- guard decisions are UNTESTED. "
+    "Install node (apt install nodejs) or set KERNELTHING_NODE=/path/to/node.",
+)
 
 
 def _run_cases(cases: list[dict]) -> list[dict]:
+    assert NODE is not None
     proc = subprocess.run(
-        ["node", str(DRIVER)],
+        [NODE, str(DRIVER)],
         input=json.dumps(cases),
         capture_output=True,
         text=True,
@@ -378,3 +404,31 @@ def test_bash_popcorn_leaderboard_flag_alone_allowed(tmp_path):
     cfg = _cfg(tmp_path)
     r = _decide(cfg, "bash", {"command": "popcorn submissions list --leaderboard cholesky"})
     assert not r["blocked"]
+
+
+# --- veloq: reading a downloaded .ncu-rep is not a GPU operation ---------------
+# The guard is a denylist, so `veloq` is allowed by construction. These pin that:
+# a new binary in the profiling path must not trip gpu-tamper or the env-dump rule.
+
+
+def test_bash_veloq_ncu_read_allowed(tmp_path):
+    cfg = _cfg(tmp_path)
+    r = _decide(
+        cfg,
+        "bash",
+        {"command": "veloq ncu inspect profile.0-batch-4096/profile.ncu-rep --row-id launch:2"},
+    )
+    assert r is None or not r.get("blocked")
+
+
+def test_bash_veloq_python_pin_allowed(tmp_path):
+    # The loop pins VELOQ_PYTHON itself; an agent echoing it back in a command is
+    # not env tampering. Only CUDA_VISIBLE_DEVICES / LD_PRELOAD / KERNELTHING_* are.
+    cfg = _cfg(tmp_path)
+    r = _decide(
+        cfg,
+        "bash",
+        {"command": "VELOQ_PYTHON=/home/u/.local/share/veloq/ncu-report-2026.2/bin/python3 "
+                    "veloq ncu warp-stalls r.ncu-rep --row-id launch:0 --by reason"},
+    )
+    assert r is None or not r.get("blocked")

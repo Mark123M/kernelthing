@@ -116,6 +116,9 @@ def run_loop(args: argparse.Namespace) -> int:
         kernelguard=not args.no_kernelguard,
         ncu=not args.no_ncu,
         wiki=not args.no_wiki,
+        veloq=not args.no_veloq,
+        ptx=not args.no_ptx,
+        mcp_cuda_docs=not args.no_cuda_docs,
         auto_setup=args.auto_setup,
         max_candidates=args.max_candidates,
         wall_clock_s=args.wall_clock,
@@ -579,6 +582,23 @@ def main(argv: list[str] | None = None) -> int:
         "--no-wiki",
         action="store_true",
         help="don't offer the agent the KernelWiki kernel-optimization knowledge base",
+    )
+    tools.add_argument(
+        "--no-veloq",
+        action="store_true",
+        help="don't offer the agent veloq for reading the downloaded .ncu-rep as "
+        "structured JSON (falls back to the flat ncu-details.txt dump)",
+    )
+    tools.add_argument(
+        "--no-ptx",
+        action="store_true",
+        help="don't offer the agent the vendored PTX/CUDA ISA reference",
+    )
+    tools.add_argument(
+        "--no-cuda-docs",
+        action="store_true",
+        help="don't declare NVIDIA's hosted CUDA-docs MCP server for the agent "
+        "(it needs a one-time interactive OAuth to be useful)",
     )
 
     web = parser.add_argument_group("web UI")
