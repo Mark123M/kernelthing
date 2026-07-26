@@ -29,6 +29,8 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from . import archive, evolve, gates, opencode_client, prompts
 from .config import Config, format_duration
 from .journal import MAX_PARALLELISM, Journal, LiveLock, LoopControl
@@ -154,6 +156,56 @@ def _vendored(path: Path) -> bool:
     but empty directory is the normal broken state, not a missing one.
     """
     return path.is_dir() and any(path.iterdir())
+
+
+def _skill_description(skill_dir: Path) -> str:
+    """A vendored skill's own ``description:``, read verbatim from SKILL.md frontmatter.
+
+    Read from the file rather than transcribed into a constant. A hand-written summary
+    of someone else's document is worse than theirs by construction, and it goes stale
+    silently the moment the vendored copy is refreshed -- the copies here are byte
+    identical to their sources, so the text is already on disk. Returns '' on any IO or
+    parse failure, like every other gate in this module.
+    """
+    try:
+        text = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    if not text.startswith("---"):
+        return ""
+    try:
+        meta: Any = yaml.safe_load(text.split("---", 2)[1])
+    except (yaml.YAMLError, IndexError):
+        return ""
+    if not isinstance(meta, dict):
+        return ""
+    return str(meta.get("description", "")).strip()
+
+
+def _skill_section(skill_dir: Path, title: str) -> str:
+    """Verbatim body of one ``## <title>`` section of a vendored SKILL.md, or ''.
+
+    The heading is dropped and the body returned exactly as written -- links, relative
+    paths and all -- so the prompt carries the skill's own reference index instead of a
+    paraphrase. Both vendored skills maintain one; the paraphrase they replaced got the
+    ordering wrong (veloq's SKILL.md leads with the routing table, not the workflow) and
+    quietly dropped entries.
+    """
+    try:
+        lines = (skill_dir / "SKILL.md").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    out: list[str] = []
+    inside = False
+    for line in lines:
+        if line.startswith("## "):
+            if inside:
+                break
+            inside = line[3:].strip() == title
+            continue
+        if inside:
+            out.append(line)
+    return "\n".join(out).strip()
 
 
 # Nsight Compute ships ``ncu_report`` as a plain module under its install tree, not on
@@ -437,42 +489,83 @@ class Orchestrator:
                     VELOQ_REF_NOTE=self._veloq_ref_note(veloq_skill),
                 )
             )
+        # The CUDA-docs MCP is the one tool here we cannot verify from this side: it is
+        # declared in opencode's config, but whether any tool actually materialises
+        # depends on an OAuth flow that happens outside kernelthing. So the block says
+        # what to do when the tool is absent rather than asserting that it is there.
+        if self.cfg.mcp_cuda_docs:
+            parts.append(
+                prompts.load_and_render_safe(
+                    "claude/kernel-tools-cuda-docs.md",
+                    "",
+                    MCP_SERVER=opencode_client.CUDA_DOCS_MCP_SERVER,
+                    MCP_TOOL=opencode_client.CUDA_DOCS_MCP_TOOL,
+                    MCP_DESCRIPTION=opencode_client.CUDA_DOCS_MCP_INSTRUCTIONS,
+                )
+            )
         return self._tools_section(parts)
 
     def _ptx_note(self, ptx_dir: Path) -> str:
         """Pointer to the vendored PTX/CUDA reference tree, or '' when absent.
 
-        The caveat leads deliberately. This skill's own workflow is local -- it opens
-        with compute-sanitizer, cuda-gdb and ``nvcc -g -G`` -- and those binaries *are*
+        Every word of substance is lifted from the skill's own SKILL.md -- its
+        ``description:`` and its two index sections -- rather than summarised here. Two
+        mechanical excisions from the description, both visible in the code below rather
+        than done by retyping it: the harness name it was written for (a different agent
+        runs here, and ``tests/test_prompts.py`` bans that role word from the prompt tree
+        for the same reason), and the trailing "Triggers on ..." list, which is
+        skill-router dispatch metadata and means nothing to an agent already holding the
+        path.
+
+        The one addition is a single sentence about the local-collection material, which
+        is where this tree genuinely contradicts the setup: it opens with
+        compute-sanitizer, cuda-gdb and ``nvcc -g -G``, and those binaries *are*
         installed on this box and will happily run against whatever consumer GPU it has,
-        at the wrong architecture, returning numbers that look real. Naming the two files
-        worth reading beats pointing at SKILL.md: of the other vendored skill, only 3 of
-        25 members ever opened it and none ran a helper.
+        at the wrong architecture, returning numbers that look real.
         """
         if not (self.cfg.ptx and _vendored(ptx_dir)):
             return ""
+        desc = _skill_description(ptx_dir).split("Triggers on")[0].strip()
+        desc = desc.replace(" for Claude Code", "")
+        body = "\n\n".join(
+            s
+            for s in (
+                _skill_section(ptx_dir, "Local API Documentation"),
+                _skill_section(ptx_dir, "Additional References"),
+            )
+            if s
+        )
         return (
-            f"\nTo decode an unfamiliar instruction in that disassembly, "
-            f"`{ptx_dir}/references/ptx-isa.md` and `{ptx_dir}/references/ptx-docs/` are "
-            f"the ISA reference, and `{ptx_dir}/references/performance-traps.md` collects "
-            "the usual pitfalls. Relative links inside resolve against "
-            f"`{ptx_dir}/`.\nThat tree is a **reference, not a workflow**: ignore every "
-            "part of it that builds, runs, debugs or profiles a kernel locally "
-            "(compute-sanitizer, cuda-gdb, nvcc, local ncu/nsys). Those tools exist here "
-            "and will run, but not on the B200 you are optimizing, so any number they "
-            "produce is noise.\n"
+            f"\nTo decode an unfamiliar instruction in that disassembly, the `ptx-skill` "
+            f"tree is vendored at `{ptx_dir}/`; every path below is relative to it.\n"
+            f"The full skill is `{ptx_dir}/SKILL.md`; below are excerpts.\n"
+            f"{('> ' + desc) if desc else ''}\n\n"
+            "Its local-collection material does not apply here: the ncu capture is made "
+            "for you by the remote profiler"
+            f"\n{body}\n"
         )
 
     @staticmethod
     def _veloq_ref_note(skill_dir: Path) -> str:
-        """Pointer to the vendored veloq analysis reference, or '' when absent."""
+        """Pointer to the vendored veloq analysis reference, or '' when absent.
+
+        Description and reference index are read straight out of the skill's SKILL.md;
+        nothing here is a summary of them. Nothing in that skill contradicts this setup
+        either -- ``veloq ncu`` is a pure reader of a report the loop already downloaded
+        -- so unlike ``_ptx_note`` there is no caveat to add, and every entry of its
+        index carries through, in its order.
+        """
         if not _vendored(skill_dir):
             return ""
-        ref = f"{skill_dir}/references"
+        desc = _skill_description(skill_dir)
+        refs = _skill_section(skill_dir, "References")
         return (
-            f"\nFor turning those numbers into a diagnosis, `{ref}/analysis-dimensions.md` "
-            f"and `{ref}/diagnosis-reference.md` map signal → cause → fix; "
-            f"`{ref}/limitations.md` lists what the counters cannot tell you.\n"
+            f"\nFor turning those numbers into a diagnosis, the `ncu-profile-analysis` "
+            f"skill is vendored at `{skill_dir}/`; every path below is relative to it.\n"
+            f"The full skill is `{skill_dir}/SKILL.md` (verb matrix, JSON envelope "
+            "contract, workflow, when to stop trusting it); below are excerpts.\n"
+            f"{('> ' + desc) if desc else ''}\n"
+            f"\n{refs}\n"
         )
 
     @staticmethod

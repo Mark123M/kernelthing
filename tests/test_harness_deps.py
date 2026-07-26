@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from kernelthing.config import Config, veloq_python
-from kernelthing.opencode_client import build_opencode_env
+from kernelthing.opencode_client import _seed_auth_for_isolated_data, build_opencode_env
 from kernelthing.orchestrator import Orchestrator, _ncu_report_pythonpath
 from kernelthing.problem import Problem
 
@@ -140,6 +140,36 @@ def test_veloq_env_pin_survives_the_per_candidate_xdg_repoint(monkeypatch):
     pinned = Path(env["VELOQ_PYTHON"])
     assert pinned.is_absolute() and pinned.is_file()
     assert not str(pinned).startswith(env["XDG_DATA_HOME"])
+
+
+def test_isolated_data_dir_gets_every_opencode_auth_file(tmp_path):
+    # opencode splits credentials across two files under $XDG_DATA_HOME/opencode:
+    # auth.json (provider keys) and mcp-auth.json (per-server OAuth tokens, written by
+    # `opencode mcp auth`). Seeding only the first leaves every candidate pointed at an
+    # unauthenticated MCP server, which fails *silently* -- the server simply
+    # contributes no tools, so the run looks normal and the docs are just never there.
+    src = tmp_path / "src"
+    (src / "opencode").mkdir(parents=True)
+    (src / "opencode" / "auth.json").write_text('{"openrouter": {"type": "api"}}')
+    (src / "opencode" / "mcp-auth.json").write_text('{"nvidia-cuda-docs": {"tokens": {}}}')
+    dst = tmp_path / "dst"
+    _seed_auth_for_isolated_data(src, dst)
+    for name in ("auth.json", "mcp-auth.json"):
+        copied = dst / "opencode" / name
+        assert copied.is_file(), f"{name} was not seeded into the isolated data dir"
+        assert copied.read_text() == (src / "opencode" / name).read_text()
+
+
+def test_auth_seeding_survives_a_partial_source(tmp_path):
+    # Only one of the two files existing is the normal state before anyone has run
+    # `opencode mcp auth`; it must copy what is there rather than skip both.
+    src = tmp_path / "src"
+    (src / "opencode").mkdir(parents=True)
+    (src / "opencode" / "auth.json").write_text("{}")
+    dst = tmp_path / "dst"
+    _seed_auth_for_isolated_data(src, dst)
+    assert (dst / "opencode" / "auth.json").is_file()
+    assert not (dst / "opencode" / "mcp-auth.json").exists()
 
 
 def test_veloq_env_pin_defers_to_an_operator_override(monkeypatch):

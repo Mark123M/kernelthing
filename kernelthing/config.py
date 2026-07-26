@@ -77,7 +77,12 @@ def format_duration(seconds: int) -> str:
 class Config:
     """Run-time knobs for one loop invocation."""
 
-    model: str = "deepseek/deepseek-v4-pro"
+    # opencode reads the FIRST path segment as the provider, so the ``openrouter/``
+    # prefix is required even though ``deepseek/deepseek-v4-pro`` is the model's own
+    # OpenRouter slug. Without it opencode looks for a ``deepseek`` provider, finds no
+    # credentials, and reports a bare "Unexpected server error" rather than an unknown
+    # model -- which reads as an outage, not a config typo.
+    model: str = "openrouter/deepseek/deepseek-v4-pro"
     opencode_timeout: int = 3600
 
     # --- search budget & shape ---

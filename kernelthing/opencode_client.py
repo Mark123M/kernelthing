@@ -29,6 +29,22 @@ GUARD_BLOCK_DIR = Path(__file__).resolve().parent.parent / "prompts" / "block"
 
 # NVIDIA's hosted CUDA-docs MCP server (OAuth-gated; see build_opencode_env).
 CUDA_DOCS_MCP_URL = "https://api.copilot.nsight.ngc.nvidia.com/mcp/cuda-docs"
+CUDA_DOCS_MCP_SERVER = "nvidia-cuda-docs"  # the key under oc_config["mcp"]
+# opencode composes MCP tool names as ``<server>_<tool>`` with a *single* underscore --
+# not the ``mcp__<server>__<tool>`` form other clients use. Observed from a real call,
+# since neither `opencode mcp list` nor `mcp debug` enumerates tools.
+CUDA_DOCS_MCP_TOOL = f"{CUDA_DOCS_MCP_SERVER}_search_cuda_docs"
+# The server's own instructions, verbatim, as returned at the MCP handshake. Held as a
+# constant because nothing here can read them: they arrive only once a client has
+# completed the OAuth flow and connected, and the sandboxed candidates never do that
+# interactively.
+CUDA_DOCS_MCP_INSTRUCTIONS = (
+    "This server provides semantic search over NVIDIA's official CUDA documentation and "
+    "code samples. The corpus is updated through early 2026 and includes libraries newer "
+    "than most model training cutoffs (e.g. cuTile, released Dec 2025). Use "
+    "search_cuda_docs before answering CUDA-related questions so the response is grounded "
+    "in current, authoritative documentation."
+)
 
 
 def opencode_state_dirs() -> list[Path]:
@@ -79,29 +95,40 @@ def _error_text(ev: dict[str, Any]) -> str | None:
     return None
 
 
+# opencode keeps provider credentials and MCP OAuth tokens in *separate* files, both
+# under ``$XDG_DATA_HOME/opencode/``. Copying only auth.json was enough while every
+# credential was a provider key; a remote MCP server authenticated with
+# ``opencode mcp auth`` writes mcp-auth.json instead ({<server>: {clientInfo, serverUrl,
+# tokens}}), and omitting it leaves every candidate connected to an unauthenticated
+# server -- which fails quietly, since the MCP simply contributes no tools.
+_AUTH_FILES = ("auth.json", "mcp-auth.json")
+
+
 def _auth_file(data_home: Path) -> Path:
     return data_home / "opencode" / "auth.json"
 
 
 def _seed_auth_for_isolated_data(src_data_home: Path, dst_data_home: Path) -> None:
-    """Mirror opencode provider auth into an isolated XDG data dir if present.
+    """Mirror opencode provider and MCP auth into an isolated XDG data dir if present.
 
-    opencode stores API keys under ``$XDG_DATA_HOME/opencode/auth.json``. The
-    evolutionary loop gives each concurrent candidate its own XDG data/cache/state
+    The evolutionary loop gives each concurrent candidate its own XDG data/cache/state
     roots to avoid SQLite/log contention, so that fresh data dir also needs the
-    already-configured auth file. Missing or unreadable auth is left for opencode
+    already-configured auth files. Missing or unreadable auth is left for opencode
     to report; auth setup should not make the wrapper itself crash.
     """
-    src = _auth_file(src_data_home)
-    dst = _auth_file(dst_data_home)
-    if src == dst or not src.is_file():
+    if src_data_home == dst_data_home:
         return
-    try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        dst.chmod(0o600)
-    except OSError:
-        return
+    for name in _AUTH_FILES:
+        src = src_data_home / "opencode" / name
+        dst = dst_data_home / "opencode" / name
+        if not src.is_file():
+            continue
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            dst.chmod(0o600)
+        except OSError:
+            continue
 
 
 def _add_tokens(total: dict[str, Any], inc: dict[str, Any]) -> None:

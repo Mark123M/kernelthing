@@ -1,87 +1,16 @@
-# Batched Cholesky, batch=16 n=512, on B200
+# B200 Batched Cholesky - batch=16 n=512
 
 ## Goal
 
-Minimise the wall-clock time of benchmark entry **index 4** of the gpu-mode
-`cholesky` leaderboard: `n: 512; cond: 2; seed: 41512; batch: 16`, fp32, on a **B200 (sm_100)**.
-
-`custom_kernel(data)` must handle that exact `(16, 512, 512)` shape with the
-specialised kernel and fall through to
-`torch.linalg.cholesky_ex(..., check_errors=False).L` for every other shape, so the
-other 14 leaderboard entries stay constant across attempts and only the target entry
-moves.
+Develop a GPU kernel for an NVIDIA B200 GPU that minimizes latency while preserving numerical correctness. Allowed languages: CUDA C++, cuBLAS, MathDx, CuTe C++/DSL.
 
 ## Problem
 
-Input `A` is a `16 x 512 x 512` CUDA tensor in `torch.float32`; every matrix is
-symmetric positive definite up to fp32 roundoff. Return a lower-triangular fp32 tensor
-`L` with a positive diagonal such that `A = L @ L.T`.
+Implement batched dense Cholesky factorization. Input is `A`, a `16 x 512 x 512` CUDA tensor in `torch.float32`. Every matrix is symmetric positive definite up to FP32 roundoff. Return a lower-triangular FP32 tensor `L` with positive diagonal. Correctness passes when `norm_1(L @ L.T - A) <= 20 * 512 * float32_epsilon * norm_1(A)`. You are scored on the runtime of this shape alone; the other 14 benchmark entries only have to keep passing.
 
-The checker is property-based, not an elementwise comparison against a library result:
-it validates shape, dtype, device, finiteness, lower-triangular structure, positive
-diagonal, and the reconstruction residual against the original fp32 input. Inputs across
-the test set cover dense covariance-like matrices, planted spectra, diagonal, damped
-low-rank, scaled rows/columns and tridiagonal SPD matrices — a kernel tuned only for
-well-conditioned dense input will fail the harder cases.
+## Rules
 
-<!-- FILL IN: what makes THIS shape different. n=512 does not fit in shared memory — this is a blocked/tiled factorisation (panel + trailing update), and with batch=16 there is little batch parallelism to hide latency with. -->
-
-## Where you are starting
-
-<!-- FILL IN. `submission.py` currently holds only the torch fallback. Replace this
-     section once you seed a real kernel: say what approach it takes, which
-     alternatives are already encoded in it, and what has already been ruled out.
-     The search reads this to avoid re-deriving what you already know. -->
-
-## Hardware and build constraints
-
-- Native code goes through `torch.utils.cpp_extension.load_inline`. The submission is a
-  single self-contained Python file; there is no second source file.
+- The submission is a single self-contained Python file `submission.py`. ONLY optimize the kernel for workload `16 x 512 x 512`, everything else should remain `torch.linalg.cholesky_ex`.
 - Compile as **C++20**. C++17 builds locally but breaks on the evaluator's PyTorch ABI.
-- The evaluation server **rejects any submission containing the substring `stream`**,
-  anywhere — inside a longer word, inside a comment, or assembled from concatenated
-  fragments. The scorer rejects it locally first so you do not waste a submission.
-- Target `sm_100`.
-
-<!-- FILL IN: the shared-memory / occupancy budget at n=512. A 512x512 fp32 matrix is 1.0 MB — far past shared memory, so the blocking factor and the trailing-update GEMM shape are the design. -->
-
-## Build & test
-
-There is no GPU here worth measuring on — correctness and timing both come from the
-hosted evaluator. Score the kernel with:
-
-    kernelthing score .
-
-It prints `{"correct": ..., "metric": ..., "unit": "us", ...}`, where `metric` is the
-mean time of benchmark index 4 in microseconds. **Lower is better.**
-`"correct": true` requires every public test shape to pass *and* every benchmark shape
-to survive its re-check.
-
-While a change is still likely broken, use the cheap pre-check — one submission instead
-of two, correctness only:
-
-    kernelthing score . --test-only
-
-Do not build or run the kernel locally, and do not trust any locally produced number.
-
-## Current state
-
-<!-- FILL IN once you have a first scored submission. Give the measured time for the
-     target index and for the neighbouring shapes you must not regress, plus the
-     submission id and date, e.g.:
-
-| shape | index | time |
-|---|---|---|
-| **n=512, batch=16 (target)** | **4** | **? µs** |
-
-Whole-board geometric mean: ? µs. Only index 4 is yours to move — the rest run
-the torch fallback and must stay put. -->
-
-## Measurement policy
-
-The scorer reads the evaluator's own numbers from the API, so the metric is the exact
-measured mean, not the three-significant-figure value the CLI prints. Resolution is not
-your limit; run-to-run noise is.
-
-<!-- FILL IN: the measured standard error for this shape once you have one, and the
-     resulting "treat >X% as real, <Y% as noise" threshold. -->
+- Do **not** build or run the kernel locally, and do not trust any locally produced performance numbers.
+- The evaluation server **rejects any submission containing the substring `stream`**, anywhere inside a longer word, inside a comment, or assembled from concatenated fragments.
