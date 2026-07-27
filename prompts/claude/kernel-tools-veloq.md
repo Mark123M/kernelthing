@@ -1,43 +1,26 @@
+### Reading the Nsight Compute report — `veloq ncu`
 
-### Reading the profile properly — `veloq`
+Every full score writes `{{REPORT}}` to the worktree. `{{VELOQ_BIN}}` parses and analyzes the report for performance optimization. Only read raw ncu artifacts when veloq is not available.
 
-`ncu-details.txt` is the flattened text view. The `.ncu-rep` beside it holds the same
-capture *structured*: per-launch metrics, the profiler's own rule findings with severities,
-and per-source-line warp-stall histograms. `veloq` reads it — no GPU involved, it is a file
-parser. Prefer it over grepping the text dump; fall back to the text only if `veloq` errors.
-
-The scorer put it at `{{REPORT}}`, overwritten by each full score. A score whose capture
-came from cache has the text dump but no report; `veloq` will say so.
+The report does not exist until your first full score. Each score overwrites it and prints
+what it landed.
 
 ```bash
-REP={{REPORT}}
-
-# 1. WHICH launch is yours? Only the first ~10 kernels are captured, and a plain
-#    PyTorch path fills them with copy/elementwise kernels. Always start here.
-{{VELOQ_BIN}} ncu launches $REP --limit 20
-
-# 2. Metrics + the profiler's rule findings for one launch (the highest-value verb:
-#    each rule carries a severity and the focus_metrics that triggered it).
-{{VELOQ_BIN}} ncu inspect $REP --row-id launch:<N>
-
-# 3. Why warps stalled, ranked.
-{{VELOQ_BIN}} ncu warp-stalls $REP --row-id launch:<N> --by reason
-
-# 4. One counter family across every launch, for comparison.
-{{VELOQ_BIN}} ncu metrics $REP --counter 'sm__throughput*,dram__throughput*'
-
-# 5. The SASS the kernel actually compiled to (PTX too, when the cubin embeds it).
-{{VELOQ_BIN}} ncu disasm $REP --row-id launch:<N>
+V={{VELOQ_BIN}}; REP={{REPORT}}
 ```
 
 JSON on stdout is the contract — read `data.rows[]`, and on failure `error.message`.
 The first call builds a cache next to the report (a few seconds); later calls are fast.
-{{PTX_NOTE}}
-Two traps, both already true of the text dump and equally true here:
+`--help` on any verb is authoritative.
+
+```bash
+{{NCU_VERBS}}
+```
+
+Two traps, equally true of the text view:
 
 - **Profiled durations are not benchmark times.** Instrumentation inflates them. Use the
   profile for *ratios and bottlenecks*; only the scorer's metric counts.
 - **Never paste profiler output into {{SUBMISSION_FILE}}**, not even in a comment. It
   contains the token the evaluator rejects on sight (the one spelled out in the profiling
   section above), and that rejects the whole submission.
-{{VELOQ_REF_NOTE}}

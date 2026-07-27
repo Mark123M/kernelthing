@@ -182,15 +182,23 @@ def _skill_description(skill_dir: Path) -> str:
     return str(meta.get("description", "")).strip()
 
 
-def _skill_section(skill_dir: Path, title: str) -> str:
-    """Verbatim body of one ``## <title>`` section of a vendored SKILL.md, or ''.
+def _skill_section(skill_dir: Path, title: str, level: int = 2) -> str:
+    """Verbatim body of one ``<level>-deep <title>`` section of a vendored SKILL.md, or ''.
 
     The heading is dropped and the body returned exactly as written -- links, relative
     paths and all -- so the prompt carries the skill's own reference index instead of a
-    paraphrase. Both vendored skills maintain one; the paraphrase they replaced got the
+    paraphrase. Every vendored skill maintains one; the paraphrase they replaced got the
     ordering wrong (veloq's SKILL.md leads with the routing table, not the workflow) and
     quietly dropped entries.
+
+    ``level`` exists for ncu-report-skill, whose ``## File index`` holds a ``### Reference
+    docs`` table and a ``### Helpers`` table. Pasting the whole section would advertise
+    helpers we spend a line telling the agent to skip -- finding them on its own is what
+    costs it a turn -- so that note asks for the subsection instead. A section that is
+    renamed upstream returns '' and drops the index, which is the fail-open behaviour
+    every gate in this module has.
     """
+    mark = "#" * level + " "
     try:
         lines = (skill_dir / "SKILL.md").read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -198,10 +206,11 @@ def _skill_section(skill_dir: Path, title: str) -> str:
     out: list[str] = []
     inside = False
     for line in lines:
-        if line.startswith("## "):
+        # Any heading at or above this level ends the section; deeper ones are its own.
+        if line.startswith("#") and len(line) - len(line.lstrip("#")) <= level:
             if inside:
                 break
-            inside = line[3:].strip() == title
+            inside = line.startswith(mark) and line[len(mark) :].strip() == title
             continue
         if inside:
             out.append(line)
@@ -209,10 +218,12 @@ def _skill_section(skill_dir: Path, title: str) -> str:
 
 
 # Nsight Compute ships ``ncu_report`` as a plain module under its install tree, not on
-# PyPI -- ``pip install ncu_report`` does not exist. The vendored ncu-report-skill's
-# helpers/ all import it, so without this the whole helper toolchain is dead the moment
-# an agent follows SKILL.md. The sandbox ro-binds / so the path resolves from any
-# worktree; we only have to tell the agent which one.
+# PyPI -- ``pip install ncu_report`` does not exist. This used to feed the prompt a
+# ``PYTHONPATH=`` for the vendored ncu-report-skill's helpers/; that pointer is gone
+# (``veloq ncu`` supersedes them, and they read only the first launch), so nothing in a
+# run depends on the local Nsight any more -- veloq brings its own pinned reader. Kept
+# as the diagnostic for the version trap documented in CLAUDE.md: it answers "which
+# ncu_report would a local script actually import?", which ``ncu --version`` does not.
 _NSIGHT_PYTHON_GLOBS = (
     "/opt/nvidia/nsight-compute/*/extras/python",
     "/usr/local/cuda*/nsight-compute*/extras/python",
@@ -433,63 +444,86 @@ class Orchestrator:
         # command and the submission rules as well as the profile, and a popcorn problem
         # cannot be worked on without them -- gating it on cfg.ncu (as the profiling
         # how-to it replaced was) would leave `--no-ncu` agents unable to score at all.
-        # cfg.ncu now narrows to what it names: the interpretation skill pointer.
-        #
-        # The skill is a git submodule and is routinely uninitialised; pointing an agent
-        # at a SKILL.md that is not there just burns a turn. Reading the capture does not
-        # depend on it, so only the pointer is dropped.
-        #
-        # SKILL.md's links are all relative and its workflow assumes a local GPU (build a
-        # .cu harness, run ncu, parse with ncu_report) -- neither is true here, so the
-        # pointer has to say so or the agent follows it off a cliff.
-        skill_note = ""
-        if self.cfg.ncu and _vendored(ncu_dir):
-            nsight = _ncu_report_pythonpath()
-            helper_note = (
-                f"Its `helpers/*.py` need `PYTHONPATH={nsight}` "
-                "(`ncu_report` ships with Nsight Compute, not pip), and they only add "
-                "value over `ncu-details.txt` for per-line stall attribution.\n"
-                if nsight
-                else "Skip its `helpers/*.py`: they import `ncu_report`, which is not "
-                "installed here.\n"
-            )
-            ref = f"{ncu_dir}/reference"
-            skill_note = (
-                "\nFor deeper interpretation — the six analysis dimensions and a "
-                f"signal→cause→fix playbook — read `{ref}/05-analysis-dimensions.md` "
-                f"and `{ref}/06-diagnosis-playbook.md`.\n"
-                f"Every link inside those files is relative: resolve it against "
-                f"`{ncu_dir}/`. Ignore `{ncu_dir}/SKILL.md`'s collection workflow — it "
-                "assumes a local GPU, and yours is remote.\n" + helper_note
-            )
+        # cfg.ncu now narrows to what it names: the ncu-report-skill section below.
         parts.append(
             prompts.load_and_render_safe(
                 "claude/kernel-tools-profile.md",
                 "",
-                NCU_SKILL_NOTE=skill_note,
                 SUBMISSION_FILE=pop.submission_file,
                 SCORE_CMD=self._score_cmd_str(),
             )
         )
-        # veloq turns the .ncu-rep the profiler already downloads into structured
-        # evidence. Gated on the binary *and* its bundled reader: the Nsight installed
-        # here is too old to open a capture from the hosted profiler (see
-        # config.veloq_python), so without the venv the block would only mislead.
+        # One section per report, then one per skill, each with its own heading. Splitting
+        # ncu from nsys is not cosmetic -- the nsys section is dropped entirely for a
+        # problem with `bench.popcorn.nsys` off, and a combined section would either leak a
+        # timeline that never lands or carry a conditional the .md cannot express.
+        #
+        # A report section is commands and constraints only. It deliberately does *not*
+        # enumerate what the capture holds: the verb list already says what each verb
+        # answers, and a prose list of "per-launch metrics, rule findings, warp-stall
+        # histograms, SASS/PTX" is the digest problem in miniature -- it pre-picks the
+        # dimensions and invites the agent to look no further than the ones named.
+        #
+        # Both are gated on the binary *and* its bundled reader: the Nsight installed here
+        # is too old to open a capture from the hosted profiler (see config.veloq_python),
+        # so without the venv the blocks would only mislead.
         veloq_bin = shutil.which("veloq")
-        if self.cfg.veloq and veloq_bin and veloq_python():
-            ptx_dir = REPO_ROOT / "vendor" / "ptx-skill"
-            veloq_skill = REPO_ROOT / "vendor" / "veloq-ncu-skill"
+        veloq_ok = bool(self.cfg.veloq and veloq_bin and veloq_python())
+        if veloq_ok:
             parts.append(
                 prompts.load_and_render_safe(
                     "claude/kernel-tools-veloq.md",
                     "",
                     VELOQ_BIN=veloq_bin,
                     REPORT=f"{popcorn.PROFILE_DIR}/{popcorn.PROFILE_SUBDIR}/profile.ncu-rep",
+                    # The verb lists live in popcorn.py because that is where they are
+                    # checked against a real capture; rendering them here is what keeps
+                    # the prompt from carrying a second copy that drifts.
+                    NCU_VERBS=popcorn.veloq_verb_block("ncu"),
                     SUBMISSION_FILE=pop.submission_file,
-                    PTX_NOTE=self._ptx_note(ptx_dir),
-                    VELOQ_REF_NOTE=self._veloq_ref_note(veloq_skill),
                 )
             )
+            parts.append(
+                self._skill_part(
+                    "Diagnosing an ncu report — `ncu-profile-analysis`",
+                    self._veloq_ref_note(REPO_ROOT / "vendor" / "veloq-ncu-skill"),
+                )
+            )
+        # B200-specific prose, not tooling -- and gated separately from the veloq blocks
+        # because it reads a report the same way whether or not veloq resolved. `--no-ncu`
+        # drops exactly this.
+        if self.cfg.ncu:
+            parts.append(
+                self._skill_part(
+                    "B200 profiling reference — `ncu-report-skill`",
+                    self._ncu_skill_note(ncu_dir),
+                )
+            )
+        if veloq_ok and pop.nsys:
+            parts.append(
+                prompts.load_and_render_safe(
+                    "claude/kernel-tools-nsys.md",
+                    "",
+                    VELOQ_BIN=veloq_bin,
+                    NSYS_REPORT=(
+                        f"{popcorn.PROFILE_DIR}/{popcorn.PROFILE_SUBDIR}/"
+                        f"{popcorn.NSYS_SUBDIR}/profile.nsys-rep"
+                    ),
+                    NSYS_VERBS=popcorn.veloq_verb_block("nsys"),
+                )
+            )
+            parts.append(
+                self._skill_part(
+                    "Reading an nsys timeline — `nsys-profile-analysis`",
+                    self._veloq_ref_note(REPO_ROOT / "vendor" / "veloq-nsys-skill"),
+                )
+            )
+        parts.append(
+            self._skill_part(
+                "PTX / CUDA ISA reference — `ptx-skill`",
+                self._ptx_note(REPO_ROOT / "vendor" / "ptx-skill"),
+            )
+        )
         # The CUDA-docs MCP is the one tool here we cannot verify from this side: it is
         # declared in opencode's config, but whether any tool actually materialises
         # depends on an OAuth flow that happens outside kernelthing. So the block says
@@ -505,6 +539,22 @@ class Orchestrator:
                 )
             )
         return self._tools_section(parts)
+
+    @staticmethod
+    def _skill_part(title: str, note: str) -> str:
+        """One vendored skill as its own headed section, or '' when its note is empty.
+
+        Every skill renders through the same template so the four sections cannot drift
+        apart in shape. The empty-note check is what makes the heading safe to put in the
+        .md: these trees are routinely absent (submodules, or a `cp -r` not yet done) and
+        each note gates itself on that, so without this a missing tree would render a
+        section header with nothing under it.
+        """
+        if not note.strip():
+            return ""
+        return prompts.load_and_render_safe(
+            "claude/kernel-tools-skill.md", "", SKILL_TITLE=title, SKILL_NOTE=note
+        )
 
     def _ptx_note(self, ptx_dir: Path) -> str:
         """Pointer to the vendored PTX/CUDA reference tree, or '' when absent.
@@ -537,8 +587,8 @@ class Orchestrator:
             if s
         )
         return (
-            f"\nTo decode an unfamiliar instruction in that disassembly, the `ptx-skill` "
-            f"tree is vendored at `{ptx_dir}/`; every path below is relative to it.\n"
+            f"\nFor decoding an unfamiliar instruction in `veloq ncu disasm` output. "
+            f"Vendored at `{ptx_dir}/`; every path below is relative to it.\n"
             f"The full skill is `{ptx_dir}/SKILL.md`; below are excerpts.\n"
             f"{('> ' + desc) if desc else ''}\n\n"
             "Its local-collection material does not apply here: the ncu capture is made "
@@ -548,25 +598,68 @@ class Orchestrator:
 
     @staticmethod
     def _veloq_ref_note(skill_dir: Path) -> str:
-        """Pointer to the vendored veloq analysis reference, or '' when absent.
+        """Pointer to one vendored veloq analysis skill, or '' when absent.
 
         Description and reference index are read straight out of the skill's SKILL.md;
-        nothing here is a summary of them. Nothing in that skill contradicts this setup
-        either -- ``veloq ncu`` is a pure reader of a report the loop already downloaded
-        -- so unlike ``_ptx_note`` there is no caveat to add, and every entry of its
-        index carries through, in its order.
+        nothing here is a summary of them. Neither veloq skill contradicts this setup --
+        both are pure readers of a report the loop already downloaded -- so unlike
+        ``_ptx_note`` there is no caveat to add, and every entry of each index carries
+        through, in its order. ``ncu-profile-analysis`` and ``nsys-profile-analysis`` are
+        the same document shape, which is why one function serves both with **no**
+        per-skill parameter: differing text would be a paraphrase creeping back in, and
+        what distinguishes the two sections is their heading, not their prose.
         """
         if not _vendored(skill_dir):
             return ""
         desc = _skill_description(skill_dir)
         refs = _skill_section(skill_dir, "References")
         return (
-            f"\nFor turning those numbers into a diagnosis, the `ncu-profile-analysis` "
-            f"skill is vendored at `{skill_dir}/`; every path below is relative to it.\n"
+            f"\nVendored at `{skill_dir}/`; every path below is relative to it.\n"
             f"The full skill is `{skill_dir}/SKILL.md` (verb matrix, JSON envelope "
             "contract, workflow, when to stop trusting it); below are excerpts.\n"
             f"{('> ' + desc) if desc else ''}\n"
             f"\n{refs}\n"
+        )
+
+    @staticmethod
+    def _ncu_skill_note(skill_dir: Path) -> str:
+        """Pointer to the vendored ncu-report-skill, or '' when absent.
+
+        A second ncu skill next to ``ncu-profile-analysis``, kept for a different reason:
+        it is B200/sm_100-specific prose (the six analysis dimensions, a
+        signal->cause->fix playbook, and sm_100 metric names that differ from every older
+        GPU's) rather than tooling. Everything *executable* in it is a trap here, and the
+        two caveats below are why this cannot be a bare "go read the skill":
+
+        - Its SKILL.md quickstart and ``reference/03-collection.md`` build a harness and
+          run ``ncu`` locally. Those binaries are installed on this box and will run, on a
+          consumer GPU at the wrong architecture, returning numbers that look real.
+        - Its ``helpers/*.py`` wrap ``ncu_report`` for a local capture: they read
+          ``range_by_idx(0).action_by_idx(0)`` and stop, carry no SASS/PTX or per-line
+          attribution, and ``rule_speedups()`` reads keys Nsight 2026.2 no longer emits,
+          so it ranks every finding at 0.0/'?' rather than erroring.
+
+        Hence the index comes from the ``### Reference docs`` subsection, not the whole
+        ``## File index`` -- pasting that table would list all seven helpers by name and
+        purpose one line above the sentence telling the agent to skip them.
+
+        The description's trailing router metadata (a list of Chinese trigger phrases) is
+        excised the same way ``_ptx_note`` drops its "Triggers on ..." tail: it is
+        skill-router dispatch data and means nothing to an agent already holding the path.
+        """
+        if not _vendored(skill_dir):
+            return ""
+        desc = _skill_description(skill_dir).split("— including variants in Chinese")[0]
+        desc = desc.strip().rstrip(",").strip()
+        index = _skill_section(skill_dir, "Reference docs (read these when you need details)", 3)
+        return (
+            f"\nVendored at `{skill_dir}/`; every path below is relative to it.\n"
+            f"{('> ' + desc) if desc else ''}\n\n"
+            "Read it for its prose only. Ignore its collection workflow and its "
+            f"`helpers/*.py`: `{skill_dir}/SKILL.md` assumes you profile locally, and the "
+            "helpers wrap a local capture, read only the first launch, and add nothing "
+            "over the report tooling you already have.\n"
+            f"\n{index}\n"
         )
 
     @staticmethod

@@ -23,12 +23,13 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import threading
 from pathlib import Path
 
 import pytest
 
-from kernelthing import popcorn
+from kernelthing import popcorn, prompts
 from kernelthing.problem import Problem
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "popcorn"
@@ -751,6 +752,7 @@ def _ok_profile(digest: str = "OPT   grid too small") -> popcorn.Profile:
     return popcorn.Profile(
         ok=True,
         details_path="/wt/profile/latest/ncu-details.txt",
+        report_path="/wt/profile/latest/profile.ncu-rep",
         digest_path="/wt/profile/latest/digest.txt",
         digest=digest,
         wall_s=251.0,
@@ -938,12 +940,20 @@ def test_the_verdict_carries_paths_not_capture_text(tmp_path, monkeypatch):
     assert detail["nsys"]["stats_path"].endswith("stats.txt")
 
 
-def test_score_command_prints_the_profile_above_the_verdict(tmp_path, monkeypatch, capsys):
-    """_cli_score finds the verdict by scanning stdout in reverse for the last line
-    starting with '{'. Printing the capture first makes that impossible to break."""
+def test_a_score_prints_where_the_captures_landed_and_nothing_static(
+    tmp_path, monkeypatch, capsys
+):
+    """A score carries state, not reference material.
+
+    Where each capture landed changes per score; the verbs that read it never do, so they
+    live in the candidate prompt and this points back at them. The 2026-07-24 run took a
+    median of 5 full scores per member (12 at the tail) -- a verb list here is that many
+    byte-identical copies resident in one context.
+    """
     digest_file = tmp_path / "digest.txt"
-    digest_file.write_text("OPT   {this line starts with a brace}\n", encoding="utf-8")
+    digest_file.write_text("OPT   grid too small, uncoalesced loads\n", encoding="utf-8")
     _fake_submit(monkeypatch, {"test": TEST_OK, "benchmark": BENCHMARK_OK})
+    monkeypatch.setattr(popcorn, "_veloq_bin", lambda: "veloq")
     prof = _ok_profile()
     prof.digest_path = str(digest_file)
     _fake_profile(monkeypatch, prof)
@@ -959,11 +969,169 @@ def test_score_command_prints_the_profile_above_the_verdict(tmp_path, monkeypatc
     assert rc == 0
     verdict = json.loads(out.strip().splitlines()[-1])
     assert verdict["correct"] is True and verdict["metric"] == pytest.approx(TARGET_US)
-    assert "Nsight Compute profile" in out
-    assert "Nsight Systems timeline" in out
-    assert "{this line starts with a brace}" in out
-    assert out.index("Nsight Compute profile") < out.index('"correct"')
+    # everything above the verdict line -- the JSON carries the same paths by design
+    blocks = "\n".join(out.strip().splitlines()[:-1])
+    # each report is named exactly once, as the variable the prompt's commands use
+    assert blocks.count("/wt/profile/latest/profile.ncu-rep") == 1
+    assert blocks.count("/wt/profile/latest/nsys/profile.nsys-rep") == 1
+    assert "REP=/wt/profile/latest/profile.ncu-rep" in blocks
+    assert "NSYS=/wt/profile/latest/nsys/profile.nsys-rep" in blocks
+    # the derived text files are noise once the report is queryable, and their content
+    # never crossed this boundary in the first place
+    assert str(digest_file) not in blocks
+    assert "/wt/profile/latest/ncu-details.txt" not in blocks
+    assert "uncoalesced loads" not in out
+    # no verb list, no capture prose: the whole point of the move
+    for verb, _why in (*popcorn.VELOQ_NCU_HINTS, *popcorn.VELOQ_NSYS_HINTS):
+        assert f" {verb.split()[0]} $" not in blocks
+    assert len(blocks) < 800, f"a score's blocks grew back to {len(blocks)} chars"
+    # ...above the verdict: _cli_score scans stdout in reverse for the last '{' line
+    assert out.index("Nsight Compute capture") < out.index('"correct"')
     assert out.index("Nsight Systems timeline") < out.index('"correct"')
+    assert out.index("--- Next ---") < out.index('"correct"')
+
+
+def test_each_reports_prompt_section_carries_its_own_verbs():
+    """The verb list is static, so it is rendered once into the candidate prompt. It lives
+    in popcorn.py because that is where it is checked against a real capture -- a second
+    copy inside the .md is how the two drift apart. One section per report: the nsys one
+    is dropped whole for a problem with bench.popcorn.nsys off."""
+    ncu = prompts.load("claude/kernel-tools-veloq.md")
+    ncu_rendered = prompts.render(
+        ncu,
+        VELOQ_BIN="/usr/bin/veloq",
+        REPORT="profile/latest/profile.ncu-rep",
+        NCU_VERBS=popcorn.veloq_verb_block("ncu"),
+        SUBMISSION_FILE="submission.py",
+        PTX_NOTE="",
+        VELOQ_REF_NOTE="",
+    )
+    nsys = prompts.load("claude/kernel-tools-nsys.md")
+    nsys_rendered = prompts.render(
+        nsys,
+        VELOQ_BIN="/usr/bin/veloq",
+        NSYS_REPORT="profile/latest/nsys/profile.nsys-rep",
+        NSYS_VERBS=popcorn.veloq_verb_block("nsys"),
+        NSYS_REF_NOTE="",
+    )
+    for verb, why in popcorn.VELOQ_NCU_HINTS:
+        assert f"$V ncu {verb}" in ncu_rendered and why in ncu_rendered
+    for verb, why in popcorn.VELOQ_NSYS_HINTS:
+        assert f"$V nsys {verb}" in nsys_rendered and why in nsys_rendered
+    # neither section leaks the other's surface -- that is what makes the nsys one droppable
+    assert "nsys" not in ncu_rendered.replace("`veloq nsys`", "")
+    assert "$V ncu" not in nsys_rendered
+    # the commands are written against the variables each fence assigns just above them,
+    # and REP/NSYS are the same names a score's block prints
+    assert "V=/usr/bin/veloq; REP=profile/latest/profile.ncu-rep" in ncu_rendered
+    assert "V=/usr/bin/veloq; NSYS=profile/latest/nsys/profile.nsys-rep" in nsys_rendered
+    assert "{{" not in ncu_rendered and "{{" not in nsys_rendered
+    # neither file may grow its own copy of a list
+    for text in (ncu, nsys):
+        assert "$V ncu " not in text and "$V nsys " not in text
+
+
+def test_a_problem_without_nsys_gets_no_timeline_section(tmp_path, monkeypatch):
+    """A timeline section for a capture that never lands is a whole block of prompt
+    pointing at an absent file. It is its own section so the gate can drop it whole."""
+    from kernelthing.config import Config, veloq_python
+    from kernelthing.orchestrator import Orchestrator
+
+    if not (shutil.which("veloq") and veloq_python()):
+        pytest.skip("veloq or its bundled reader is not installed")
+
+    def block(**popcorn_cfg):
+        o = Orchestrator.__new__(Orchestrator)
+        o.problem = _problem(tmp_path, **popcorn_cfg)
+        o.cfg = Config()
+        return Orchestrator._kernel_tools_block.func(o)
+
+    on, off = block(nsys=True), block(nsys=False)
+    assert "Reading the Nsight Systems timeline" in on
+    assert "Reading the Nsight Systems timeline" not in off
+    assert "nsys-profile-analysis" in on and "nsys-profile-analysis" not in off
+    # the ncu half is untouched either way -- the split is what makes that true
+    assert "Reading the Nsight Compute report" in on and "Reading the Nsight Compute report" in off
+
+
+def test_the_score_points_back_at_the_verbs_it_no_longer_prints():
+    """The verb list sits at the top of a context a score fires thousands of tokens into.
+    Naming veloq in the per-score output is the only thing that sends an agent back to it."""
+    detail = {"profile": _ok_profile().record(), "nsys": _ok_nsys().record()}
+    both = "\n".join(
+        (
+            popcorn.format_profile_block(detail),
+            popcorn.format_nsys_block(detail),
+            popcorn.format_analysis_directive(detail),
+        )
+    )
+    assert "veloq ncu" in both and "veloq nsys" in both
+
+
+def test_the_score_ends_by_asking_for_one_bottleneck_and_one_change(tmp_path, monkeypatch, capsys):
+    """Members routinely named three bottlenecks and changed four things at once, which
+    makes a regression un-attributable. The directive is singular on both counts."""
+    _fake_submit(monkeypatch, {"test": TEST_OK, "benchmark": BENCHMARK_OK})
+    _fake_profile(monkeypatch, _ok_profile())
+    _fake_nsys(monkeypatch, _ok_nsys())
+
+    class Args:
+        test_only = False
+        emit_baseline = False
+        profile = True
+
+    popcorn.score_command(_problem(tmp_path, nsys=True), Args())
+    out = " ".join(capsys.readouterr().out.split())
+    assert "exactly one high impact performance bottleneck" in out
+    assert "exactly one optimization strategy" in out
+    assert "CUDA-docs MCP" in out and "ptx-skill" in out
+
+
+def test_the_directive_names_only_the_reports_that_landed():
+    """Pointing at an Nsight Systems report that failed to capture is how an agent burns
+    a turn proving the file is not there."""
+    ncu_only = popcorn.format_analysis_directive({"profile": _ok_profile().record()})
+    assert "Nsight Compute" in ncu_only and "Nsight Systems" not in ncu_only
+    nsys_only = popcorn.format_analysis_directive({"nsys": _ok_nsys().record()})
+    assert "Nsight Systems" in nsys_only and "Nsight Compute" not in nsys_only
+    dead = popcorn.Profile(ok=False, error="brev queue timeout")
+    assert popcorn.format_analysis_directive({"profile": dead.record()}) == ""
+
+
+def test_the_flat_text_view_is_the_fallback_when_the_report_cannot_be_queried(monkeypatch):
+    """Two ways to get here: no veloq on PATH, and a cached score (the 80MB report is
+    deliberately not cached). Both must leave the agent a path, not a dead command."""
+    monkeypatch.setattr(popcorn, "_veloq_bin", lambda: "")
+    block = popcorn.format_profile_block({"profile": _ok_profile().record()})
+    assert "/wt/profile/latest/ncu-details.txt" in block and "veloq" not in block
+
+    monkeypatch.setattr(popcorn, "_veloq_bin", lambda: "veloq")
+    prof = _ok_profile()
+    prof.report_path = ""
+    prof.cached = True
+    block = popcorn.format_profile_block({"profile": prof.record()})
+    assert "/wt/profile/latest/ncu-details.txt" in block and "veloq ncu" not in block
+    assert "cached" in block
+
+
+def test_a_multiline_profiler_error_cannot_shadow_the_verdict(tmp_path, monkeypatch, capsys):
+    """Error text is the one thing in the block we do not author. A newline in it followed
+    by a brace would make _cli_score's reverse scan read the wrong line as the verdict."""
+    _fake_submit(monkeypatch, {"test": TEST_OK, "benchmark": BENCHMARK_OK})
+    _fake_profile(
+        monkeypatch,
+        popcorn.Profile(ok=False, error='popcorn CLI failed\n{"job": "brev-1", "state": "x"}'),
+    )
+
+    class Args:
+        test_only = False
+        emit_baseline = False
+        profile = True
+
+    assert popcorn.score_command(_problem(tmp_path), Args()) == 0
+    out = capsys.readouterr().out
+    assert json.loads(out.strip().splitlines()[-1])["correct"] is True
+    assert "brev-1" in out  # the error is still readable, just flattened
 
 
 def test_score_command_says_so_when_the_capture_failed(tmp_path, monkeypatch, capsys):

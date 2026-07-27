@@ -50,8 +50,33 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.set_float32_matmul_precision("highest")
 
-    diag = torch.linspace(1.0, 2.0, args.n, device="cuda", dtype=torch.float32)
-    data = torch.diag_embed(diag.repeat(args.batch, 1))
+    # A dense SPD batch whose spectrum is exactly linspace(1, 2) -- so condition number
+    # exactly 2, which is what every shape on the board is generated at (`cond: 2`).
+    #
+    # This used to be diag_embed(linspace(...)) alone. That already had the right
+    # spectrum, but every off-diagonal was an exact zero, so any kernel that branches on
+    # a value -- an early exit on a small pivot, an isfinite guard, a non-convergence
+    # fallback -- took a path it would never take on the board, and the timeline was of
+    # the wrong code. (Nothing else changed: ptxas never sees the data, zeros are normal
+    # values at full FP32 throughput, and the storage is dense either way.)
+    #
+    # Built with ONE Householder reflector rather than a random orthogonal Q: for
+    # Q = I - 2vv^T with v a unit vector, A = QDQ is a rank-2 update of D, so this is
+    # O(batch*n^2) with a single extra temporary. Going through torch.linalg.qr would be
+    # O(n^3) with a large workspace -- ~minutes of dead time at n=32768, on a capture
+    # whose whole budget is PROFILE_TIMEOUT_S. All of it lands before cudaProfilerStart,
+    # so it costs the profile nothing either way, but it does cost the job's wall clock.
+    d = torch.linspace(1.0, 2.0, args.n, device="cuda", dtype=torch.float32)
+    d = d.repeat(args.batch, 1)
+    v = torch.randn(args.batch, args.n, 1, device="cuda", dtype=torch.float32)
+    v /= v.norm(dim=1, keepdim=True)
+    w = d.unsqueeze(-1) * v  # D v
+    s = (w * v).sum(dim=1, keepdim=True)  # v^T D v
+    data = torch.diag_embed(d)
+    data.baddbmm_(w, v.mT, alpha=-2.0)
+    data.baddbmm_(v, w.mT, alpha=-2.0)
+    data.baddbmm_(4.0 * s * v, v.mT)
+    del d, v, w, s
     torch.cuda.synchronize()
 
     with torch.no_grad():

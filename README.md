@@ -141,10 +141,14 @@ Two vendored [KDA](https://github.com/mit-han-lab/kernel-design-agents) skills
 
 - **KernelWiki** (`vendor/KernelWiki`) — Blackwell/Hopper kernel-optimization
   knowledge base (read-only query).
-- **ncu-report-skill** (`vendor/ncu-report-skill`) — Nsight Compute profiling
-  interpretation workflow.
+- **ncu-report-skill** (`vendor/ncu-report-skill`) — B200/sm_100 analysis
+  dimensions, a signal→cause→fix playbook, and sm_100 metric names. Prose only:
+  its collection workflow and `helpers/` assume a local GPU.
+- **ncu-profile-analysis / nsys-profile-analysis** (`vendor/veloq-ncu-skill`,
+  `vendor/veloq-nsys-skill`) — how to interrogate the two reports with `veloq`.
+- **ptx-skill** (`vendor/ptx-skill`) — PTX/CUDA ISA reference.
 
-Disable with `--no-wiki` / `--no-ncu`.
+Disable with `--no-wiki` / `--no-ncu` / `--no-veloq` / `--no-ptx`.
 
 A full remote score automatically overlaps timing with two profiles of the scored shape:
 hosted Nsight Compute via popcorn, and a minimal Modal/B200 Nsight Systems timeline for

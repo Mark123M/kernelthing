@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import evolve, opencode_client, prompts
+from . import evolve, opencode_client, popcorn, prompts
 from .bootstrap import protected_files
 from .config import REPO_ROOT, Config
 from .orchestrator import (
@@ -222,48 +222,85 @@ def render_kernel_tools(cfg: Config) -> str:
             )
         )
 
-    ncu_skill_note = ""
-    if cfg.ncu:
-        ncu_skill_note = (
-            "\nFor deeper interpretation -- the six analysis dimensions and a "
-            "signal->cause->fix playbook -- read `{{NCU_SKILL_DIR}}/reference/"
-            "05-analysis-dimensions.md` and `{{NCU_SKILL_DIR}}/reference/"
-            "06-diagnosis-playbook.md`.\n"
-            "Every link inside those files is relative: resolve it against "
-            "`{{NCU_SKILL_DIR}}/`. Ignore `{{NCU_SKILL_DIR}}/SKILL.md`'s collection "
-            "workflow - it assumes a local GPU, and yours is remote.\n"
-            "Its `helpers/*.py` need `PYTHONPATH={{NSIGHT_COMPUTE_PYTHONPATH}}` "
-            "(`ncu_report` ships with Nsight Compute, not pip), and they only add "
-            "value over `ncu-details.txt` for per-line stall attribution.\n"
-        )
     parts.append(
         prompts.load_and_render_safe(
             "claude/kernel-tools-profile.md",
             "",
-            NCU_SKILL_NOTE=ncu_skill_note,
             SUBMISSION_FILE="{{SUBMISSION_FILE}}",
             SCORE_CMD="{{SCORE_CMD}}",
         )
     )
 
+    def skill(title: str, note: str, tree: str, placeholder: str) -> str:
+        # Same headed-section template the orchestrator uses, with the absolute vendor
+        # path swapped back out for its placeholder -- a dump is of the configuration, so
+        # nothing in it should be specific to this checkout's location.
+        return Orchestrator._skill_part(
+            title, note.replace(str(REPO_ROOT / "vendor" / tree), placeholder)
+        )
+
     if cfg.veloq:
-        ptx_dir = REPO_ROOT / "vendor" / "ptx-skill"
-        veloq_skill = REPO_ROOT / "vendor" / "veloq-ncu-skill"
-        ptx_note = Orchestrator._ptx_note(_PlaceholderOrchestrator(cfg), ptx_dir)
-        ptx_note = ptx_note.replace(str(ptx_dir), "{{PTX_SKILL_DIR}}")
-        veloq_note = Orchestrator._veloq_ref_note(veloq_skill)
-        veloq_note = veloq_note.replace(str(veloq_skill), "{{VELOQ_SKILL_DIR}}")
         parts.append(
             prompts.load_and_render_safe(
                 "claude/kernel-tools-veloq.md",
                 "",
                 VELOQ_BIN="{{VELOQ_BIN}}",
                 REPORT="{{REPORT}}",
+                NCU_VERBS=popcorn.veloq_verb_block("ncu"),
                 SUBMISSION_FILE="{{SUBMISSION_FILE}}",
-                PTX_NOTE=ptx_note,
-                VELOQ_REF_NOTE=veloq_note,
             )
         )
+        parts.append(
+            skill(
+                "Diagnosing an ncu report — `ncu-profile-analysis`",
+                Orchestrator._veloq_ref_note(REPO_ROOT / "vendor" / "veloq-ncu-skill"),
+                "veloq-ncu-skill",
+                "{{VELOQ_SKILL_DIR}}",
+            )
+        )
+
+    if cfg.ncu:
+        parts.append(
+            skill(
+                "B200 profiling reference — `ncu-report-skill`",
+                Orchestrator._ncu_skill_note(REPO_ROOT / "vendor" / "ncu-report-skill"),
+                "ncu-report-skill",
+                "{{NCU_SKILL_DIR}}",
+            )
+        )
+
+    # Dump mode assumes every enabled tool works, so unlike the orchestrator this is not
+    # also gated on the problem's bench.popcorn.nsys -- a dump is of the configuration,
+    # not of one problem's capture plan.
+    if cfg.veloq:
+        parts.append(
+            prompts.load_and_render_safe(
+                "claude/kernel-tools-nsys.md",
+                "",
+                VELOQ_BIN="{{VELOQ_BIN}}",
+                NSYS_REPORT="{{NSYS_REPORT}}",
+                NSYS_VERBS=popcorn.veloq_verb_block("nsys"),
+            )
+        )
+        parts.append(
+            skill(
+                "Reading an nsys timeline — `nsys-profile-analysis`",
+                Orchestrator._veloq_ref_note(REPO_ROOT / "vendor" / "veloq-nsys-skill"),
+                "veloq-nsys-skill",
+                "{{NSYS_SKILL_DIR}}",
+            )
+        )
+
+    parts.append(
+        skill(
+            "PTX / CUDA ISA reference — `ptx-skill`",
+            Orchestrator._ptx_note(
+                _PlaceholderOrchestrator(cfg), REPO_ROOT / "vendor" / "ptx-skill"
+            ),
+            "ptx-skill",
+            "{{PTX_SKILL_DIR}}",
+        )
+    )
 
     if cfg.mcp_cuda_docs:
         parts.append(
@@ -529,6 +566,11 @@ def source_inventory(cfg: Config) -> JSONDict:
     prompt_files.append("prompts/claude/kernel-tools-profile.md")
     if cfg.veloq:
         prompt_files.append("prompts/claude/kernel-tools-veloq.md")
+        prompt_files.append("prompts/claude/kernel-tools-nsys.md")
+    # One template, rendered once per vendored skill (ncu-profile-analysis,
+    # ncu-report-skill, nsys-profile-analysis, ptx-skill) so the sections cannot drift.
+    if cfg.veloq or cfg.ncu or cfg.ptx:
+        prompt_files.append("prompts/claude/kernel-tools-skill.md")
     if cfg.mcp_cuda_docs:
         prompt_files.append("prompts/claude/kernel-tools-cuda-docs.md")
     return {

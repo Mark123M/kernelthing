@@ -245,23 +245,28 @@ Consequences worth knowing before editing it:
   (such a problem cannot be scored at all, so there is nothing to tell it). That block is
   **unconditional**, unlike the ones around it: it carries the scoring command and the submission
   rules, so gating it (as its `kernel-tools-popcorn-ncu.md` predecessor was gated on `cfg.ncu`)
-  would leave `--no-ncu` agents unable to score. `cfg.ncu` now gates only the interpretation-skill
-  pointer.
+  would leave `--no-ncu` agents unable to score. `cfg.ncu` now gates only
+  the `ncu-report-skill` section (`_ncu_skill_note`).
 - **`popcorn` extracts captures relative to its own cwd, not to `--output`.** `profile_submission`
   runs it in a `TemporaryDirectory` and moves the result, exactly as `submit` already did, which is
   why nothing lands at the worktree root any more and why the `workdir` trap is gone. The two ignore
   rules per problem (`profile/` **and** `profile.*/`) stay: `profile/` is where the scorer now puts
   captures, and `profile.*/` still catches anything run by hand.
-- **`ncu_report` ships inside Nsight Compute, not on PyPI** — `pip install ncu_report` does not
-  exist. Every `helpers/*.py` in `vendor/ncu-report-skill` imports it, so the whole helper toolchain
-  is dead unless the prompt names the path. `_ncu_report_pythonpath()` globs the install tree
-  (`/opt/nvidia/nsight-compute/*/extras/python`, the CUDA-bundled locations) and the skill note
-  passes it through as a `PYTHONPATH=`; it returns `""` and drops the note when Nsight is absent,
-  failing open like every other gate. The note also tells agents to resolve the skill's relative
-  links against the vendor dir and to ignore its local-GPU collection workflow — `SKILL.md` step 4
-  ("parse with `ncu_report`, not by eye-balling the CLI") contradicts this prompt, which says to
-  `cat ncu-details.txt`. The prompt wins; only 3 of 25 members ever opened `SKILL.md` and none ran a
-  helper.
+- **`vendor/ncu-report-skill` is pointed at for its prose, never its `helpers/`.** The skill note
+  names `reference/05-analysis-dimensions.md` and `reference/06-diagnosis-playbook.md`, tells agents
+  to resolve the skill's relative links against the vendor dir, and says to ignore its local-GPU
+  collection workflow — `SKILL.md` step 4 ("parse with `ncu_report`, not by eye-balling the CLI")
+  contradicts this prompt. It then explicitly steers *away* from `helpers/`, which is cheaper than
+  letting an agent find them: they are thin `ncu_report` wrappers for a local capture that read
+  `range_by_idx(0).action_by_idx(0)` and stop, carry no SASS/PTX or per-line counter attribution,
+  and whose `rule_speedups()` reads keys (`estimated_speedup_pct`, `rule_name`,
+  `message_for_display`) that Nsight 2026.2's `rule_results_as_dicts()` does not emit — it ranks
+  all 18 findings at `0.0`/`'?'` instead of erroring. `veloq ncu` covers every one of those axes
+  (and `plot_timeline.py`'s PM-sampling series, its one unique trick, finds 0 `pmsampling:*`
+  metrics in a hosted capture). Historically only 3 of 25 members ever opened `SKILL.md` and none
+  ran a helper. `_ncu_report_pythonpath()` survives with **no production caller** — it is the
+  diagnostic for the version trap below, not a prompt input; nothing in a run depends on the
+  locally-installed Nsight any more, since veloq ships its own pinned reader.
 - **Installing a newer Nsight does not make it the one in use** — both that glob and `ncu` itself
   can keep silently resolving the old build. The `.run` installer defaults to
   `/usr/local/NVIDIA-Nsight-Compute-<ver>/`, which matches neither glob shape. And
@@ -306,24 +311,60 @@ a minimal Modal/B200 Nsight Systems timeline for Cholesky problems:
 - **It is evidence, not a verdict.** Every failure path returns a `Profile` / `NsysProfile` with
   `ok=False` and an `error`; none raise. The join is in a `finally`, so no exit path leaks a
   thread. Losing a capture must never change whether a kernel scored.
-- **The digest, not the dump, is what the agent sees.** `profile_digest` cuts a 21KB `--set full`
-  capture to ~12KB by keeping the launch header, four sections (Speed Of Light, Launch Statistics,
-  Occupancy, Warp State) and *every* `OPT`/`INF`/`WRN` finding — the findings are what name a
-  bottleneck. Unparseable input returns `""`; a profiler that changes format costs a digest, not a
-  score.
+- **A score prints state; the prompt carries the reference material.** This is the split to
+  preserve. `format_profile_block` / `format_nsys_block` emit ~600 bytes total: per capture, a
+  banner saying whether it landed, **one** path bound to the `REP=` / `NSYS=` variable, and a line
+  pointing at the verbs. The verbs themselves (`VELOQ_NCU_HINTS` / `VELOQ_NSYS_HINTS`, ~4.4KB)
+  render **once** into `kernel-tools-veloq.md` via `veloq_verb_block`, because they are static —
+  the same 30 lines regardless of what was measured. The 2026-07-24 run took a **median of 5 full
+  scores per member, 12 at the tail**, so printing them per score meant ~22KB (up to ~53KB) of
+  byte-identical text permanently resident in one member's context, against 4.4KB once in a cached
+  prompt prefix. Do not move static text back into a score; do not move per-score state into the
+  prompt. Earlier still, the block inlined a 12KB digest plus up to 12KB of nsys stats, which put
+  the same pre-chosen dozen numbers in front of the agent every time and invited it to stop there —
+  one report holds ~22.5k metrics and ~108 rule findings a digest cannot reach. Every listed `ncu`
+  verb is smoke-tested against a real capture; the `nsys` verbs are flag-checked against `--help`
+  only, since no `.nsys-rep` exists on this box.
+- **`format_analysis_directive` closes every score with the marching order** — one bottleneck, one
+  optimization, CUDA-docs MCP and ptx-skill for API/hardware questions. It names only the reports
+  that actually landed (`ok`) and prints nothing when neither did: pointing an agent at a capture
+  that failed costs it a turn proving the file is absent. It is **also the recency anchor** for the
+  verb list now that the list sits at the top of a context each score fires thousands of tokens
+  into — naming veloq here is what sends the agent back to it. Front-loading reference material is
+  how the vendored ncu skill ended up opened by 3 of 25 members; the anchor is the mitigation, so
+  keep both blocks naming `veloq ncu` / `veloq nsys` explicitly.
+- **The flat text view is the fallback, and only that** (`_capture_block`). Two ways to reach it:
+  no `veloq` on PATH, or a cached score (the 80MB report is deliberately not re-downloaded). Both
+  print `ncu-details.txt` / `stats.txt` instead of a path the agent cannot query — and since the
+  verb list is unconditional in the prompt now, this per-score line is the *only* thing that tells
+  an agent the report named up there is absent this time. `profile_digest` still writes `digest.txt`
+  beside them, but nothing the agent sees names it any more; it is a human artifact now.
 - **Nsight Systems is v1 Cholesky-only.** It parses `batch`, `n` and `seed` from
-  `benchmark_spec`, sends the submission source to `kernelthing/nsys_modal.py`, warms once on a
-  diagonal SPD tensor, and captures one CUDA-profiler-range call. Missing Modal auth, missing CLI,
-  unsupported leaderboards, malformed specs, timeouts and empty artifacts all become
-  `bench.nsys.ok=false`.
+  `benchmark_spec`, sends the submission source to `kernelthing/nsys_modal.py`, warms once, and
+  captures one CUDA-profiler-range call. Missing Modal auth, missing CLI, unsupported
+  leaderboards, malformed specs, timeouts and empty artifacts all become `bench.nsys.ok=false`.
+- **Its input is a dense SPD batch, built from one Householder reflector.** `A = QDQ` for
+  `Q = I - 2vvᵀ` and `D = linspace(1, 2)`, so the spectrum — and therefore `cond` — is exactly 2,
+  matching every benchmark row on the board (they are all `cond: 2` with no `case:` field). It was
+  `diag_embed(linspace(...))` alone, which had the right spectrum but exact-zero off-diagonals:
+  `case: diagonal` is one of the service's *correctness* cases, not a timed one, so the timeline
+  was of a code path the board never benchmarks. Any kernel branching on a value — early exit on a
+  small pivot, an `isfinite` guard, a non-convergence fallback — profiled wrong. Nothing else was
+  affected: ptxas never sees the data, zeros are normal FP32 values at full throughput, and the
+  storage is dense either way. **Keep the construction O(batch·n²)** — the rank-2 update is why
+  this is milliseconds instead of the minutes `torch.linalg.qr` would cost at n=32768. It all runs
+  before `cudaProfilerStart`, so it never enters the capture, but it does spend the job's wall
+  clock against `PROFILE_TIMEOUT_S`.
 - **`brev_defuse` hyphenates the evaluator's rejected substring** before any of this reaches an
   agent. Nsight prints it once per kernel header, and quoting a capture verbatim would hand the
   agent a string that silently poisons any file it lands in.
 - **The verdict JSON carries paths, never capture text** (`Profile.record` / `NsysProfile.record`). The JSON line is the
   seam; a 12KB digest or nsys stats body crossing it would land in every `result.json` and every
-  journal event on every score. `score_command` prints the digest/stats to stdout **above** the
+  journal event on every score. `score_command` prints the hint blocks to stdout **above** the
   verdict instead, because `_cli_score` finds the JSON by scanning stdout in reverse for the last
-  line starting with `{`.
+  line starting with `{`. `_one_line` flattens profiler error text into its banner for the same
+  reason — it is the only part of a block we do not author, and a newline plus a brace in it would
+  shadow the verdict.
 
 `tests/fixtures/popcorn/ncu-details.txt` is a verbatim capture (index 2 of the cholesky board,
 recovered from member 10's `opencode.ndjson`). Re-capture rather than hand-edit, like the
@@ -336,8 +377,31 @@ The scorer writes `profile/latest/{ncu-details.txt,digest.txt,profile.ncu-rep}` 
 a rounded rendering; the ncu report holds the same capture structured — per-launch metrics, the
 profiler's rule findings with severities and `focus_metrics`, and per-source-line warp-stall
 histograms. `veloq ncu <verb>` reads it, **on this box, with no GPU** — it is a file parser.
-`prompts/claude/kernel-tools-veloq.md` teaches the verbs inline (measured on a real capture:
-9 launches, 108 rule findings, 22509 metrics).
+`veloq nsys <verb>` does the same for the `.nsys-rep` (it also accepts a pre-exported
+`_pqtdir/`, not the `.sqlite`). Measured on a real capture: 9 launches, 108 rule findings,
+22509 metrics.
+
+**One verb list, in `popcorn.py`.** `VELOQ_NCU_HINTS` / `VELOQ_NSYS_HINTS` are the only copy;
+`kernel-tools-veloq.md` carries `{{NCU_VERBS}}` and `kernel-tools-nsys.md` carries
+`{{NSYS_VERBS}}`, which `_kernel_tools_block` and `dump_prompts` both fill from
+`popcorn.veloq_verb_block(group)`. The constants are where the list is checked against a real
+capture, so a hand-written copy inside a `.md` is how the prompt and reality drift apart. The
+rendered commands are written against `$V`/`$REP`/`$NSYS`, assigned in a fence just above them —
+the same variable names a score's block prints, so a path copied out of a score drops into a
+command copied out of the prompt.
+
+**One section per report, each self-contained** (its own `V=`/`REP=` or `V=`/`NSYS=` fence and
+verbs). That is not cosmetic: the nsys section is dropped entirely when a problem sets
+`bench.popcorn.nsys` false, and a combined section would either leak a timeline that never lands or
+need a conditional the `.md` cannot express. `test_each_reports_prompt_section_carries_its_own_verbs`
+asserts neither section leaks the other's surface.
+
+**A report section is commands and constraints only.** It does *not* enumerate what the capture
+holds — no "per-launch metrics, rule findings, warp-stall histograms, SASS/PTX". That is the digest
+problem in miniature: a prose list pre-picks the dimensions and invites the agent to look no further
+than the ones named, when the verb list beside it already says what each verb answers and the report
+holds ~22.5k metrics. Keep the framing to where the file is, how to query it, and what not to
+believe.
 
 Two things make this fragile enough to be worth the note:
 
@@ -366,15 +430,50 @@ Two things make this fragile enough to be worth the note:
 
 `~/.claude/skills` and `~/.agents/skills` are tmpfs-masked, and that is where the useful ones
 actually live. So they are copied into `vendor/` and surfaced as **paths in the prompt**:
-`vendor/veloq-ncu-skill` (the veloq analysis references) and `vendor/ptx-skill` (PTX/CUDA ISA).
-Both are plain copies, not submodules — `git submodule update --init` is broken repo-wide.
 
-Point at **named files, never a `SKILL.md`**: of `vendor/ncu-report-skill`, only 3 of 25 members
-ever opened it and none ran a helper. `_ptx_note` / `_veloq_ref_note` follow that rule.
+| tree | source skill | note builder | section heading |
+|---|---|---|---|
+| `vendor/veloq-ncu-skill` | `ncu-profile-analysis` (veloq's) | `_veloq_ref_note` | Diagnosing an ncu report |
+| `vendor/veloq-nsys-skill` | `nsys-profile-analysis` (veloq's) | `_veloq_ref_note` | Reading an nsys timeline |
+| `vendor/ncu-report-skill` | `b200-ncu-report-skill` (`DongyunZou/ncu-report-skill`) | `_ncu_skill_note` | B200 profiling reference |
+| `vendor/ptx-skill` | `ptx-skill` | `_ptx_note` | PTX / CUDA ISA reference |
 
-`_ptx_note` leads with a caveat rather than the paths, and it is load-bearing: that skill opens
-with `compute-sanitizer`, `cuda-gdb` and `nvcc -g -G`, and those binaries **are installed here
-and will run** — on a consumer GPU at the wrong architecture, returning numbers that look real.
+All are plain copies, not submodules — `git submodule update --init` is broken repo-wide. Refresh
+one with `cp -r ~/.claude/skills/<name> vendor/<tree>`; `test_every_pointed_at_skill_file_exists`
+is what catches a copy that lost its `references/`, since `_vendored()` only tests the directory.
+
+**Each gets its own `###` section, all four through `_skill_part` + `kernel-tools-skill.md`.** They
+used to be trailing `{{*_NOTE}}` placeholders glued onto the end of whatever section happened to be
+nearby, which meant four different framings for four documents of the same kind. One template makes
+them un-driftable, and it is why the note builders take no per-skill wording: what distinguishes the
+sections is the heading. `_skill_part` returns `''` for an empty note, so an absent tree drops the
+whole section — that check is what makes it safe to put the heading in the `.md`.
+
+Point at **named files, never a bare `SKILL.md`**: of `vendor/ncu-report-skill`, only 3 of 25
+members ever opened it and none ran a helper. Every note above follows that rule — description and
+reference index are read *verbatim from the vendored SKILL.md* (`_skill_description` /
+`_skill_section`), never transcribed, because a hand-written summary of someone else's document is
+worse than theirs by construction and goes stale silently the moment the copy is refreshed.
+
+The two veloq skills share `_veloq_ref_note` with **no per-skill parameter at all**: same document
+shape, so any differing text would be paraphrase creeping back in. Neither contradicts this setup —
+both are pure readers of a report the loop already downloaded — so neither needs a caveat.
+
+**The other two do, and theirs are load-bearing:**
+
+- `_ptx_note` leads with the caveat rather than the paths: that skill opens with
+  `compute-sanitizer`, `cuda-gdb` and `nvcc -g -G`, and those binaries **are installed here and
+  will run** — on a consumer GPU at the wrong architecture, returning numbers that look real.
+- `_ncu_skill_note` is prose-only by construction. Its SKILL.md quickstart and
+  `reference/03-collection.md` build a harness and profile locally (same trap), and its
+  `helpers/*.py` are dead — they read `range_by_idx(0).action_by_idx(0)` and stop, carry no
+  SASS/PTX or per-line attribution, and `rule_speedups()` reads keys Nsight 2026.2 no longer emits,
+  so it ranks all 18 findings at `0.0`/`'?'` rather than erroring. That is why the index comes from
+  the **`### Reference docs` subsection**, not the whole `## File index` — pasting that table would
+  name all seven helpers one line above the sentence telling the agent to skip them. Hence
+  `_skill_section`'s `level` parameter. It also excises the description's trailing Chinese trigger
+  phrases, the same way `_ptx_note` drops its "Triggers on …" tail: router dispatch metadata means
+  nothing to an agent already holding the path.
 
 ### CUDA-docs MCP (`opencode_client.CUDA_DOCS_MCP_URL`)
 
@@ -442,7 +541,12 @@ no longer exist:
 
 - `prompts/claude/bootstrap-problem.md`, `bootstrap-mode-{auto,interactive}.md` — loaded by
   `bootstrap.py`.
-- `prompts/claude/kernel-tools-{wiki,profile,veloq,cuda-docs}.md` — loaded by `Orchestrator._kernel_tools_block`.
+- `prompts/claude/kernel-tools-{wiki,profile,veloq,nsys,skill,cuda-docs}.md` — loaded by
+  `Orchestrator._kernel_tools_block`. One section per tool surface; `veloq` is the Nsight Compute
+  half and `nsys` the Nsight Systems half, split so the latter can be dropped whole for a problem
+  with `bench.popcorn.nsys` off. `skill.md` is a two-line template (`### {{SKILL_TITLE}}` +
+  `{{SKILL_NOTE}}`) rendered **once per vendored skill** by `_skill_part`, so all four skill
+  sections have identical shape and none can drift.
 - `prompts/block/*.md` (20) — rendered by `guard_core.js`, one per `block(cfg, "<name>", ...)` call.
   `render()` falls back to the inline message when a file is missing, so a stale name degrades
   quietly; that is also why an unreferenced template is invisible until you go looking.

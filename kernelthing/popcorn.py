@@ -67,6 +67,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -130,7 +131,55 @@ PROFILE_TIMEOUT_S = 1200
 PROFILE_DIR = "profile"
 PROFILE_SUBDIR = "latest"
 NSYS_SUBDIR = "nsys"
-NSYS_STATS_MAX_CHARS = 12_000
+
+# Which verb answers which question -- never the capture text itself. This list used to be
+# a ~12KB digest inlined in every score, which put a fixed handful of pre-chosen numbers in
+# front of the agent and invited it to stop there; one report holds ~22.5k metrics and ~108
+# rule findings that no digest can reach. Hints leave the choice of question to the agent.
+# `<N>` placeholders are deliberate: the first verb in each list hands out the row ids for
+# the rest.
+#
+# Rendered into the *candidate prompt* (`kernel-tools-veloq.md`, once per member), not into
+# each score. It is static -- same 30 lines regardless of what was measured -- and the
+# 2026-07-24 run took a median of 5 full scores per member (12 at the tail), so printing it
+# per score meant ~22KB of byte-identical text resident in a member's context, up to ~53KB,
+# versus 4.4KB once in a cached prompt prefix. What a score prints instead is the *state*
+# no constant can carry: whether each capture landed, and where. `format_analysis_directive`
+# is the recency anchor that sends the agent back here -- see it for why that split.
+VELOQ_NCU_HINTS = (
+    ("launches $REP --limit 20", "every captured launch + its row id -- START HERE"),
+    ("summary $REP", "totals: launch / metric / rule / disasm counts, NCU version"),
+    ("inspect $REP --row-id launch:<N>", "one launch: all metrics + rule findings"),
+    ("metrics $REP --counter 'sm__throughput*,dram__throughput*'", "one counter family, all launches"),
+    ("warp-stalls $REP --row-id launch:<N> --by reason", "why warps stalled (--by line|sass)"),
+    ("source-metrics $REP --row-id launch:<N> --counter '*bank_conflict*'", "per-source-line attribution"),
+    ("sources $REP", "which cubin each launch ran out of; has_disasm flag"),
+    ("disasm $REP --row-id launch:<N>", "SASS (+ PTX when the cubin embeds it)"),
+    ("ranges $REP", "range workloads, if captured under --replay-mode range"),
+    ("graphs $REP", "CUDA-graph workloads, if captured under --graph-profiling graph"),
+    ("schema <verb>", "JSON schema of any verb's response; reads no report"),
+)
+VELOQ_NSYS_HINTS = (
+    ("stats $NSYS --type kernel --limit 20", "hottest kernels by total GPU time -- START HERE"),
+    ("summary $NSYS", "what the trace contains: tables, span, capability flags"),
+    ("stats $NSYS --type runtime --collapse-versioned --limit 20", "CPU-side CUDA API cost"),
+    ("stats $NSYS --type memcpy --sort gbps:desc", "transfer bandwidth, H2D vs D2H"),
+    ("search $NSYS --type kernel --limit 20", "filter events -> row ids for inspect/correlate"),
+    ("inspect $NSYS kernel:<N>", "full detail for one event (row id is positional here)"),
+    ("correlate $NSYS kernel:<N>", "the CPU launch call behind a GPU kernel, and back"),
+    ("gaps $NSYS --scope device --limit 20", "idle bubbles (--scope stream|trace)"),
+    ("concurrency $NSYS", "GPU overlap: union vs sum busy time, compute/copy split"),
+    ("timeline $NSYS --interval 1ms", "bucketed GPU activity over time"),
+    ("slices $NSYS", "per-NVTX-range CPU bounds + attributed GPU work"),
+    ("graph-replays $NSYS", "CUDA graph replays and the nodes dominating them"),
+    ("metrics $NSYS --type gpu", "PM-sampling series (--type nic|cpu-sampling|cpu-sched)"),
+    ("hardware $NSYS", "profiled CPU / GPU / NIC inventory"),
+    ("ncu-command $NSYS kernel:<N>", "the Nsight Compute rerun command for one kernel"),
+    ("correlation-stats $NSYS", "per-kind row stats of the CPU<->GPU correlation index"),
+    ("prep $NSYS", "warm the parquet/sidecar caches up front (--status to check)"),
+    ("viz timeline $NSYS", "export a bounded timeline window as an SVG"),
+    ("schema <verb>", "JSON schema of any verb's response; reads no trace"),
+)
 
 # ncu-details.txt sections worth quoting back in full. The rule findings (OPT/INF/WRN)
 # are always kept and are what actually names a bottleneck; these three carry the numbers
@@ -1562,85 +1611,134 @@ def score(
             pool.shutdown(wait=True)
 
 
-def format_profile_block(detail: dict[str, Any]) -> str:
-    """The profile section ``score_command`` prints above the verdict, or ''.
+def _veloq_bin() -> str:
+    """``"veloq"`` when it is on PATH, else ``""``.
 
-    This is the whole point of capturing automatically: the numbers arrive in the same
-    tool output as the score, so an agent cannot reason about a bottleneck without having
-    measured one. It leads with the profiler's own findings and says where the rest is.
+    Returning the bare name rather than the resolved path is the point: ``which``
+    succeeding *proves* the bare name works from here, and the hint blocks are read
+    inside the sandbox where an absolute path from some other PATH entry would only be
+    noise. Empty means the hints are dropped -- never printed as a command that is not
+    there.
     """
-    prof = detail.get("profile")
+    return "veloq" if shutil.which("veloq") else ""
+
+
+def _one_line(text: Any) -> str:
+    """Collapse a message to a single line for a ``--- ... ---`` banner.
+
+    ``_cli_score`` finds the verdict by scanning stdout in reverse for the last line
+    starting with ``{``, so an error string carrying a newline followed by a brace could
+    otherwise shadow it. Profiler errors are the one thing here we do not author.
+    """
+    return " ".join(str(text or "unknown").split())
+
+
+def _hint_lines(
+    hints: tuple[tuple[str, str], ...], veloq: str, group: str, indent: str = ""
+) -> list[str]:
+    """Render ``VELOQ_*_HINTS`` as an aligned ``veloq <group> <verb>  # what for`` list.
+
+    The comment column is capped rather than set by the longest command: two of the ncu
+    verbs carry a ``--counter`` glob and would otherwise push every comment 40 columns
+    right, which is what makes a list like this read as a wall.
+    """
+    cmds = [f"{indent}{veloq} {group} {verb}" for verb, _ in hints]
+    width = min(max(len(c) for c in cmds), 62)
+    return [f"{c.ljust(width)}  # {why}" for c, (_, why) in zip(cmds, hints, strict=True)]
+
+
+def veloq_verb_block(group: str) -> str:
+    """The ``veloq <group>`` verb list for ``kernel-tools-veloq.md``, or ``''``.
+
+    The prompt renders this rather than carrying its own copy: keeping the verbs in two
+    places is how the prompt and reality drift apart, and this list is checked against a
+    real capture. Commands are written against ``$V``/``$REP``/``$NSYS``, which the prompt
+    assigns just above -- the same variable names a score's block prints, so a path copied
+    out of a score drops straight into a command copied out of the prompt.
+    """
+    hints = {"ncu": VELOQ_NCU_HINTS, "nsys": VELOQ_NSYS_HINTS}.get(group)
+    return "\n".join(_hint_lines(hints, "$V", group)) if hints else ""
+
+
+def _capture_block(prof: Any, *, kind: str, noun: str, var: str, group: str, text_key: str) -> str:
+    """One capture's status in a score: did it land, and where.
+
+    Deliberately just the state. The verbs that read it are static, so they live in the
+    candidate prompt (see ``VELOQ_NCU_HINTS``) and this points back at them; what cannot
+    live there is whether *this* score produced a queryable report. Two ways it did not:
+    no ``veloq`` on PATH, and a cached score (the 80MB capture is not re-downloaded).
+    Both leave the agent the flat text view's path rather than a dead command.
+    """
     if not isinstance(prof, dict):
         return ""
     if not prof.get("ok"):
-        reason = str(prof.get("error") or "unknown")
-        return f"--- Nsight Compute profile unavailable: {reason} ---"
-    digest_path = str(prof.get("digest_path") or "")
-    body = ""
-    if digest_path:
-        with contextlib.suppress(OSError):
-            body = Path(digest_path).read_text(encoding="utf-8").strip()
-    lines = [
-        "--- Nsight Compute profile of the scored shape "
-        + ("(cached: identical submission) " if prof.get("cached") else "")
-        + "---",
-        "Instrumented durations run ~2x the benchmark time; read this for ratios and",
-        "bottlenecks, never as a timing. The evaluator's rejected token is hyphenated",
-        "below, so nothing here is safe to paste into the submission either way.",
-        "",
-        body,
-        "",
-    ]
-    if prof.get("details_path"):
-        lines.append(f"Full --set full dump: {prof['details_path']}")
-    if prof.get("report_path"):
-        lines.append(f"Structured capture (veloq ncu ...): {prof['report_path']}")
-    lines.append("--- end profile ---")
-    return "\n".join(lines)
+        return f"--- {kind} profile unavailable: {_one_line(prof.get('error'))} ---"
+    cached = " (cached: identical submission)" if prof.get("cached") else ""
+    head = f"--- {kind} {noun} of the scored shape{cached} ---"
+    report = str(prof.get("report_path") or "")
+    if report and _veloq_bin():
+        return f"{head}\n  {var}={report}\n  Query it with the `veloq {group}` verbs in your tools section."
+    text = str(prof.get(text_key) or "")
+    if not text:
+        return f"{head}\n  No readable artifact this score."
+    return f"{head}\n  No queryable report this score. Flat text view: {text}"
 
 
-def nsys_stats_digest(stats: str) -> str:
-    """Keep the nsys stats block readable in a score transcript."""
-    text = stats.strip()
-    if len(text) <= NSYS_STATS_MAX_CHARS:
-        return text
-    return text[:NSYS_STATS_MAX_CHARS].rstrip() + "\n... truncated ..."
+def format_profile_block(detail: dict[str, Any]) -> str:
+    """The Nsight Compute status ``score_command`` prints above the verdict, or ''."""
+    return _capture_block(
+        detail.get("profile"),
+        kind="Nsight Compute",
+        noun="capture",
+        var="REP",
+        group="ncu",
+        text_key="details_path",
+    )
 
 
 def format_nsys_block(detail: dict[str, Any]) -> str:
-    """The Nsight Systems section ``score_command`` prints above the verdict, or ''."""
-    prof = detail.get("nsys")
-    if not isinstance(prof, dict):
-        return ""
-    if not prof.get("ok"):
-        reason = str(prof.get("error") or "unknown")
-        return f"--- Nsight Systems profile unavailable: {reason} ---"
-    stats_path = str(prof.get("stats_path") or "")
-    body = ""
-    if stats_path:
-        with contextlib.suppress(OSError):
-            body = nsys_stats_digest(
-                Path(stats_path).read_text(encoding="utf-8", errors="replace")
-            )
-    lines = [
-        "--- Nsight Systems timeline of the scored shape "
-        + ("(cached: identical submission) " if prof.get("cached") else "")
-        + "---",
-        "Captured on Modal/B200 after one warmup call. Use this for launch order,",
-        "CUDA API overhead, memcpy/kernel balance and gaps; only the scorer metric",
-        "is the authoritative timing.",
-        "",
+    """The Nsight Systems status ``score_command`` prints above the verdict, or ''."""
+    return _capture_block(
+        detail.get("nsys"),
+        kind="Nsight Systems",
+        noun="timeline",
+        var="NSYS",
+        group="nsys",
+        text_key="stats_path",
+    )
+
+
+# Printed once under whichever captures landed. The blocks above say what landed and where;
+# this says what to do with it, and it is deliberately singular on both counts -- the
+# 2026-07-24 run's members routinely named three bottlenecks and changed four things at
+# once, which makes a regression un-attributable and a win unrepeatable.
+#
+# It is also the recency anchor for the verb list, which now sits at the top of a context
+# this fires several thousand tokens into. Naming veloq here is what sends the agent back
+# to it; a score that printed only paths would be pointing at a tool it never mentions.
+ANALYSIS_DIRECTIVE = (
+    "Analyze the Nsight Compute and Nsight Systems reports using veloq and identify "
+    "exactly one high impact performance bottleneck. Then, design and implement exactly "
+    "one optimization strategy. Use the CUDA-docs MCP and the vendored ptx-skill to answer "
+    "API and hardware questions."
+)
+
+
+def format_analysis_directive(detail: dict[str, Any]) -> str:
+    """The marching order under the capture blocks, or '' when nothing was captured."""
+    landed = [
+        kind
+        for kind in ("profile", "nsys")
+        if isinstance(detail.get(kind), dict) and detail[kind].get("ok")
     ]
-    if body:
-        lines += [body, ""]
-    if prof.get("stats_path"):
-        lines.append(f"Stats summary: {prof['stats_path']}")
-    if prof.get("sqlite_path"):
-        lines.append(f"SQLite export: {prof['sqlite_path']}")
-    if prof.get("report_path"):
-        lines.append(f"GUI report: {prof['report_path']}")
-    lines.append("--- end nsys profile ---")
-    return "\n".join(lines)
+    if not landed:
+        return ""
+    text = ANALYSIS_DIRECTIVE
+    if landed == ["profile"]:
+        text = text.replace(" and Nsight Systems", "")
+    elif landed == ["nsys"]:
+        text = text.replace("Nsight Compute and ", "")
+    return "--- Next ---\n" + textwrap.fill(text, width=84)
 
 
 def score_command(problem: Problem, args: Any) -> int:
@@ -1662,7 +1760,11 @@ def score_command(problem: Problem, args: Any) -> int:
         test_only=bool(getattr(args, "test_only", False)),
         profile=getattr(args, "profile", None),
     )
-    for block in (format_profile_block(detail), format_nsys_block(detail)):
+    for block in (
+        format_profile_block(detail),
+        format_nsys_block(detail),
+        format_analysis_directive(detail),
+    ):
         if block:
             print(block)
     result: dict[str, Any] = {

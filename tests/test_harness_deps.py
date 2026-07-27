@@ -262,3 +262,23 @@ def test_problem_sources_are_not_ignored():
             text=True,
         )
         assert not proc.stdout.strip(), f"{gi} ignores problem sources: {proc.stdout}"
+
+
+def test_every_pointed_at_skill_file_exists():
+    """The prompt names files inside the vendored trees, so a skill copied without its
+    references/ silently sends every agent to a path that is not there. Vendoring is a
+    plain `cp -r` -- nothing checks it, and `_vendored()` only tests the directory."""
+    named = {
+        "veloq-ncu-skill": ["SKILL.md", "references/diagnosis-reference.md"],
+        "veloq-nsys-skill": ["SKILL.md", "references/capabilities.md"],
+        "ncu-report-skill": [
+            "SKILL.md",
+            "reference/05-analysis-dimensions.md",
+            "reference/06-diagnosis-playbook.md",
+            "reference/08-b200-metric-names.md",
+        ],
+    }
+    for tree, files in named.items():
+        for rel in files:
+            path = REPO / "vendor" / tree / rel
+            assert path.is_file(), f"prompt names {path}, which does not exist"
