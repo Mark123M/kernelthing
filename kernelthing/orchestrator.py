@@ -338,12 +338,20 @@ class Orchestrator:
         """Absolute-path scoring command the agent can self-test with.
 
         Constructs one from the venv so the agent never has to discover kernelthing
-        on PATH. The problem's own ``score_command`` (if set) takes priority."""
+        on PATH. The problem's own ``score_command`` (if set) takes priority.
+
+        ``--brief`` is here rather than in the prompt template because the template
+        appends flags to this string (``{{SCORE_CMD}} --test-only``), so one place
+        covers both invocations. It drops the ``bench`` record, which is 98% of the
+        verdict line and which only the archive reads -- ``_cli_score`` runs its own
+        invocation *without* it, so nothing is lost from result.json or the journal.
+        A problem that brings its own ``score_command`` is returned untouched: we do
+        not know that an arbitrary command understands the flag."""
         venv_bin = Path(sys.executable).parent
         kt = str(venv_bin / "kernelthing")
         if self.problem.score_command:
             return self.problem.score_command
-        return f"{kt} score ."
+        return f"{kt} score . --brief"
 
     def _preflight(self) -> None:
         """Fail loudly on a scoring command the agents cannot actually run.
@@ -431,20 +439,23 @@ class Orchestrator:
         pyexe = sys.executable or "python3"
         wiki_dir = REPO_ROOT / "vendor" / "KernelWiki"
         ncu_dir = REPO_ROOT / "vendor" / "ncu-report-skill"
-        if self.cfg.wiki and _vendored(wiki_dir):
-            parts.append(
-                prompts.load_and_render_safe(
-                    "claude/kernel-tools-wiki.md",
-                    "",
-                    PYTHON=pyexe,
-                    WIKI_DIR=str(wiki_dir),
-                )
-            )
-        # Unconditional, unlike the blocks around it. This one carries the scoring
-        # command and the submission rules as well as the profile, and a popcorn problem
-        # cannot be worked on without them -- gating it on cfg.ncu (as the profiling
-        # how-to it replaced was) would leave `--no-ncu` agents unable to score at all.
-        # cfg.ncu now narrows to what it names: the ncu-report-skill section below.
+        # Ordering is three bands: what the agent *does* every turn, then the reference
+        # material it consults when stuck, then the command surfaces it types. Commands
+        # last is deliberate -- the verb lists are the most actionable thing here, and
+        # this block sits immediately above the task, so last is the recency slot. It is
+        # also why the skills that interpret a report are allowed to precede the verbs
+        # that produce it: each section is self-contained (`_veloq_ref_note` opens with
+        # its own vendored path), so nothing reads as a forward reference. The two
+        # backward ones do still hold -- kernel-tools-veloq.md cites "the profiling
+        # section above" for the rejected token, and kernel-tools-nsys.md defers to the
+        # ncu section on treating durations as ratios; both stay above their citers.
+        #
+        # Band 1: the turn loop. Unconditional, unlike everything after it -- this block
+        # carries the scoring command and the submission rules as well as the profile,
+        # and a popcorn problem cannot be worked on without them. Gating it on cfg.ncu
+        # (as the profiling how-to it replaced was) would leave `--no-ncu` agents unable
+        # to score at all. cfg.ncu now narrows to what it names: the ncu-report-skill
+        # section below.
         parts.append(
             prompts.load_and_render_safe(
                 "claude/kernel-tools-profile.md",
@@ -453,36 +464,13 @@ class Orchestrator:
                 SCORE_CMD=self._score_cmd_str(),
             )
         )
-        # One section per report, then one per skill, each with its own heading. Splitting
-        # ncu from nsys is not cosmetic -- the nsys section is dropped entirely for a
-        # problem with `bench.popcorn.nsys` off, and a combined section would either leak a
-        # timeline that never lands or carry a conditional the .md cannot express.
-        #
-        # A report section is commands and constraints only. It deliberately does *not*
-        # enumerate what the capture holds: the verb list already says what each verb
-        # answers, and a prose list of "per-launch metrics, rule findings, warp-stall
-        # histograms, SASS/PTX" is the digest problem in miniature -- it pre-picks the
-        # dimensions and invites the agent to look no further than the ones named.
-        #
-        # Both are gated on the binary *and* its bundled reader: the Nsight installed here
-        # is too old to open a capture from the hosted profiler (see config.veloq_python),
-        # so without the venv the blocks would only mislead.
+        # Band 2: reference documents, one `###` section each. The veloq-backed ones are
+        # gated on the binary *and* its bundled reader: the Nsight installed here is too
+        # old to open a capture from the hosted profiler (see config.veloq_python), so
+        # without the venv they would only mislead.
         veloq_bin = shutil.which("veloq")
         veloq_ok = bool(self.cfg.veloq and veloq_bin and veloq_python())
         if veloq_ok:
-            parts.append(
-                prompts.load_and_render_safe(
-                    "claude/kernel-tools-veloq.md",
-                    "",
-                    VELOQ_BIN=veloq_bin,
-                    REPORT=f"{popcorn.PROFILE_DIR}/{popcorn.PROFILE_SUBDIR}/profile.ncu-rep",
-                    # The verb lists live in popcorn.py because that is where they are
-                    # checked against a real capture; rendering them here is what keeps
-                    # the prompt from carrying a second copy that drifts.
-                    NCU_VERBS=popcorn.veloq_verb_block("ncu"),
-                    SUBMISSION_FILE=pop.submission_file,
-                )
-            )
             parts.append(
                 self._skill_part(
                     "Diagnosing an ncu report — `ncu-profile-analysis`",
@@ -501,29 +489,11 @@ class Orchestrator:
             )
         if veloq_ok and pop.nsys:
             parts.append(
-                prompts.load_and_render_safe(
-                    "claude/kernel-tools-nsys.md",
-                    "",
-                    VELOQ_BIN=veloq_bin,
-                    NSYS_REPORT=(
-                        f"{popcorn.PROFILE_DIR}/{popcorn.PROFILE_SUBDIR}/"
-                        f"{popcorn.NSYS_SUBDIR}/profile.nsys-rep"
-                    ),
-                    NSYS_VERBS=popcorn.veloq_verb_block("nsys"),
-                )
-            )
-            parts.append(
                 self._skill_part(
                     "Reading an nsys timeline — `nsys-profile-analysis`",
                     self._veloq_ref_note(REPO_ROOT / "vendor" / "veloq-nsys-skill"),
                 )
             )
-        parts.append(
-            self._skill_part(
-                "PTX / CUDA ISA reference — `ptx-skill`",
-                self._ptx_note(REPO_ROOT / "vendor" / "ptx-skill"),
-            )
-        )
         # The CUDA-docs MCP is the one tool here we cannot verify from this side: it is
         # declared in opencode's config, but whether any tool actually materialises
         # depends on an OAuth flow that happens outside kernelthing. So the block says
@@ -536,6 +506,58 @@ class Orchestrator:
                     MCP_SERVER=opencode_client.CUDA_DOCS_MCP_SERVER,
                     MCP_TOOL=opencode_client.CUDA_DOCS_MCP_TOOL,
                     MCP_DESCRIPTION=opencode_client.CUDA_DOCS_MCP_INSTRUCTIONS,
+                )
+            )
+        parts.append(
+            self._skill_part(
+                "PTX / CUDA ISA reference — `ptx-skill`",
+                self._ptx_note(REPO_ROOT / "vendor" / "ptx-skill"),
+            )
+        )
+        # Band 3: command surfaces. One section per report, never a combined one --
+        # the nsys section is dropped whole for a problem with `bench.popcorn.nsys` off,
+        # and a merged section would either leak a timeline that never lands or carry a
+        # conditional the .md cannot express.
+        #
+        # A report section is commands and constraints only. It deliberately does *not*
+        # enumerate what the capture holds: the verb list already says what each verb
+        # answers, and a prose list of "per-launch metrics, rule findings, warp-stall
+        # histograms, SASS/PTX" is the digest problem in miniature -- it pre-picks the
+        # dimensions and invites the agent to look no further than the ones named.
+        if veloq_ok:
+            parts.append(
+                prompts.load_and_render_safe(
+                    "claude/kernel-tools-veloq.md",
+                    "",
+                    VELOQ_BIN=veloq_bin,
+                    REPORT=f"{popcorn.PROFILE_DIR}/{popcorn.PROFILE_SUBDIR}/profile.ncu-rep",
+                    # The verb lists live in popcorn.py because that is where they are
+                    # checked against a real capture; rendering them here is what keeps
+                    # the prompt from carrying a second copy that drifts.
+                    NCU_VERBS=popcorn.veloq_verb_block("ncu"),
+                    SUBMISSION_FILE=pop.submission_file,
+                )
+            )
+        if veloq_ok and pop.nsys:
+            parts.append(
+                prompts.load_and_render_safe(
+                    "claude/kernel-tools-nsys.md",
+                    "",
+                    VELOQ_BIN=veloq_bin,
+                    NSYS_REPORT=(
+                        f"{popcorn.PROFILE_DIR}/{popcorn.PROFILE_SUBDIR}/"
+                        f"{popcorn.NSYS_SUBDIR}/profile.nsys-rep"
+                    ),
+                    NSYS_VERBS=popcorn.veloq_verb_block("nsys"),
+                )
+            )
+        if self.cfg.wiki and _vendored(wiki_dir):
+            parts.append(
+                prompts.load_and_render_safe(
+                    "claude/kernel-tools-wiki.md",
+                    "",
+                    PYTHON=pyexe,
+                    WIKI_DIR=str(wiki_dir),
                 )
             )
         return self._tools_section(parts)

@@ -23,6 +23,9 @@ mypy kernelthing                       # strict; tests/vendor/problems/sandbox e
 kernelthing problems/<name> -j 8       # run the loop; web UI at http://127.0.0.1:8765
 kernelthing score <problem-dir>        # authoritative scorer, prints {correct, metric, unit}
 kernelthing score <dir> --test-only    # correctness only; halves the cost on popcorn problems
+kernelthing score <dir> --brief        # verdict without the bench record (what agents run)
+kernelthing score <dir> --dry-run      # submit nothing: replay what an agent reads, from fixtures
+kernelthing score <dir> --dry-run cached|nsys-fail|test-fail   # ...the degraded blocks
 kernelthing web --root ~/.cache/kernelthing   # replay/serve runs with no loop process
 kernelthing web --root ~/.local/share/kernelthing/runs   # ...the same, over the durable archive
 kernelthing archive --list                    # runs still sitting in the disposable managed root
@@ -168,6 +171,27 @@ separate process per score keeps concurrent scorings isolated — they share a s
 mutate the cwd. The verdict is one JSON line `{correct, metric, error, unit, bench}` that the
 orchestrator, journal, `members/<id>/result.json`, and the web UI all consume unchanged, so scoring
 stays swappable behind that boundary.
+
+**`bench` is the archive; `--brief` drops it, and the agent's command carries that flag.**
+Two callers read that line and they want opposite things. `_cli_score` wants everything: it
+carries `bench` opaquely into `result.json` and the journal, and *no consumer anywhere reads a
+field of it* — it is forensic, and worth keeping for exactly that reason. An agent wants the
+verdict. Measured on one full score, `bench` is **3907 of 3982 chars (98%)**, of which `shapes`
+alone is 63% — fourteen per-shape rows it cannot act on, since `metric_mode = "shape"` means one
+index scores — and `profile`/`nsys` another 20%, repeating paths the banners above already
+printed. So `Orchestrator._score_cmd_str` hands agents `kernelthing score . --brief` and
+`_cli_score` runs its own invocation without it: **4715 → 806 chars per full score, nothing lost
+from the archive.** Nothing is lost from the agent either — a failure's reason is in `error` (and
+on stderr), never in `bench`.
+
+The flag lives in `_score_cmd_str` rather than the prompt template because the template *appends*
+to that string (`{{SCORE_CMD}} --test-only`), so one place covers both invocations; a problem
+with its own `score_command` is returned untouched, since an arbitrary command need not know the
+flag. `test_the_scoring_command_handed_to_agents_is_one_the_cli_accepts` runs the exact string
+through the parser, both bare and with what the prompt appends — a flag that stopped parsing
+would fail the way a dangling path does, silently and on every candidate (see `_preflight`).
+`bootstrap-problem.md` deliberately keeps the full form: authoring a new problem is where the
+`bench` record is the thing you are debugging, and it happens once, not 117 times.
 
 ### The remote scoring backend (`popcorn.py`)
 
@@ -325,14 +349,25 @@ a minimal Modal/B200 Nsight Systems timeline for Cholesky problems:
   one report holds ~22.5k metrics and ~108 rule findings a digest cannot reach. Every listed `ncu`
   verb is smoke-tested against a real capture; the `nsys` verbs are flag-checked against `--help`
   only, since no `.nsys-rep` exists on this box.
-- **`format_analysis_directive` closes every score with the marching order** — one bottleneck, one
-  optimization, CUDA-docs MCP and ptx-skill for API/hardware questions. It names only the reports
-  that actually landed (`ok`) and prints nothing when neither did: pointing an agent at a capture
-  that failed costs it a turn proving the file is absent. It is **also the recency anchor** for the
-  verb list now that the list sits at the top of a context each score fires thousands of tokens
-  into — naming veloq here is what sends the agent back to it. Front-loading reference material is
-  how the vendored ncu skill ended up opened by 3 of 25 members; the anchor is the mitigation, so
-  keep both blocks naming `veloq ncu` / `veloq nsys` explicitly.
+- **`format_analysis_directive` opens every score with the marching order** — one bottleneck, one
+  optimization, the analysis skills by name, the CUDA-docs MCP and ptx-skill for API/hardware
+  questions. Instruction before data: it leads, the capture blocks that say what landed follow.
+  It prints nothing when neither capture landed, and *that* is the load-bearing case now that it
+  is first — a score that captured nothing must not open by sending the agent to read reports that
+  are not there. Since it no longer sits in the recency slot, the pointer back to the prompt's verb
+  list rides on the capture blocks instead, so keep both of those naming `veloq ncu` / `veloq nsys`
+  explicitly (front-loading reference material is how the vendored ncu skill ended up opened by
+  3 of 25 members).
+
+  **It is not wrapped, deliberately.** It used to go through `textwrap.fill(width=84)` — the only
+  `textwrap` call in the codebase, wrapping one of five blocks in an output whose `REP=`/`NSYS=`
+  lines run to 111 chars unwrapped. The reader is a model, not a terminal, and every candidate
+  width breaks one of the hyphenated names the directive exists to hand over verbatim: 70 splits
+  `ncu-report-skill`, 84 `nvidia-cuda-docs`, 100 `nsys-profile-analysis`. Keep it one line.
+
+  One thing about the current wording is worth knowing before editing it: the per-report narrowing
+  is **inert**. `format_analysis_directive` replaces `" and Nsight Systems"` / `"Nsight Compute
+  and "`, and the text contains neither, so a score where only one capture landed still names both.
 - **The flat text view is the fallback, and only that** (`_capture_block`). Two ways to reach it:
   no `veloq` on PATH, or a cached score (the 80MB report is deliberately not re-downloaded). Both
   print `ncu-details.txt` / `stats.txt` instead of a path the agent cannot query — and since the
@@ -369,6 +404,43 @@ a minimal Modal/B200 Nsight Systems timeline for Cholesky problems:
 `tests/fixtures/popcorn/ncu-details.txt` is a verbatim capture (index 2 of the cholesky board,
 recovered from member 10's `opencode.ndjson`). Re-capture rather than hand-edit, like the
 `--output` fixtures beside it.
+
+### Seeing what a score prints without paying for one (`dryrun.py`)
+
+The text above — two capture banners, the directive, the verdict — is the loop's tightest
+feedback channel and was invisible until a real submission had been paid for.
+`kernelthing score <dir> --dry-run [SCENARIO]` replays it from `tests/fixtures/popcorn/`.
+Three properties are the whole point, and are what `tests/test_dryrun.py` holds:
+
+- **It drives the real `popcorn.score_command`.** Only the three network boundaries are
+  swapped (`_BOUNDARIES` = `submit`, `profile_submission`, `profile_nsys_submission`), so
+  block order, wording and the verdict dict all come from production code — edit a banner
+  and the replay follows without `dryrun.py` being touched. `test_stdout_is_the_production_fold_and_carries_no_dry_run_marker`
+  re-renders the blocks from the verdict's own `bench` dict and demands equality.
+- **stdout is byte-exact; the "this is a replay" notice goes to stderr.** A marker on
+  stdout would defeat the comparison the command exists for. Nothing downstream ever
+  passes `--dry-run`, so the fake verdict has no path into a journal.
+- **It submits nothing, writes nothing, and does not touch the submission cache** — the
+  swap is above `_cache_load`/`_cache_store` and above the code that creates
+  `profile/latest/`. `resolve_config` and `_precheck` *do* run against the problem's real
+  `submission.py`, so a dry run still catches a bad manifest or a rejected substring.
+
+- **A replay is always brief, and there is no flag to opt out.** It replays what an
+  *agent* reads and agents run `--brief`, so a bare `--dry-run` must too — faithfully
+  rendering output no candidate ever sees would be worse than no replay at all.
+  `test_the_replay_is_exactly_what_an_agent_runs` pins the bare command to
+  `_score_cmd_str`'s flags. A **real** score is untouched and still defaults to full.
+  Nothing needs an escape hatch for `bench`: a test that wants it takes `popcorn.score`
+  under `_replayed` directly (a better check than a flag existing to be looked at), and
+  every archived run already has 20-odd `result.json` files showing its shape.
+
+`--test-only` / `--no-profile` are not re-implemented; they reach `score` unchanged.
+The scenarios exist because the degraded blocks are the ones nobody sees until they happen
+in a run: `cached` (the 80MB report is not re-downloaded, so there is no path to query),
+`nsys-fail` (a reason instead of a path, and the directive drops to naming ncu alone),
+`test-fail` (exit 1, no blocks at all — profilers fire at test-pass, so a broken kernel
+never spends a slot). Fixtures ship with the source tree, so `--dry-run` needs an editable
+install; it says so rather than raising when they are absent.
 
 ### Reading the capture: `veloq`, and the version trap (`config.veloq_python`)
 
@@ -547,6 +619,23 @@ no longer exist:
   with `bench.popcorn.nsys` off. `skill.md` is a two-line template (`### {{SKILL_TITLE}}` +
   `{{SKILL_NOTE}}`) rendered **once per vendored skill** by `_skill_part`, so all four skill
   sections have identical shape and none can drift.
+
+  **Section order is three bands**, and `test_the_tools_block_is_ordered_turn_loop_then_reference_then_commands`
+  pins the exact list — appending a `parts.append` at the bottom of the method is otherwise
+  invisible until someone reads a rendered prompt:
+
+  1. *the turn loop* — Timing / Profiling / Rules (`profile.md`, one file, three `###`s)
+  2. *reference* — ncu-profile-analysis, ncu-report-skill, nsys-profile-analysis, CUDA-docs MCP, ptx-skill
+  3. *commands* — `veloq ncu`, `veloq nsys`, KernelWiki
+
+  Commands last is the recency slot: this block sits immediately above the task. That the
+  skills interpreting a report precede the verbs producing it is fine — every section is
+  self-contained (`_veloq_ref_note` opens with its own vendored path), so none reads as a
+  forward reference. The two *backward* citations are the constraint to preserve:
+  `kernel-tools-veloq.md` cites "the profiling section above" for the evaluator-rejected token,
+  and `kernel-tools-nsys.md` defers to the ncu section on durations-as-ratios. `dump_prompts.render_kernel_tools`
+  mirrors the order, asserted by `test_the_dump_renders_the_sections_in_the_order_candidates_get_them` —
+  a dump in a different order would document a prompt no candidate receives.
 - `prompts/block/*.md` (20) — rendered by `guard_core.js`, one per `block(cfg, "<name>", ...)` call.
   `render()` falls back to the inline message when a file is missing, so a stale name degrades
   quietly; that is also why an unreferenced template is invisible until you go looking.

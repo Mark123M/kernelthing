@@ -67,7 +67,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -144,8 +143,8 @@ NSYS_SUBDIR = "nsys"
 # 2026-07-24 run took a median of 5 full scores per member (12 at the tail), so printing it
 # per score meant ~22KB of byte-identical text resident in a member's context, up to ~53KB,
 # versus 4.4KB once in a cached prompt prefix. What a score prints instead is the *state*
-# no constant can carry: whether each capture landed, and where. `format_analysis_directive`
-# is the recency anchor that sends the agent back here -- see it for why that split.
+# no constant can carry: whether each capture landed, and where. Each capture block names
+# its own `veloq <group>`, which is what sends the agent back here -- see `_capture_block`.
 VELOQ_NCU_HINTS = (
     ("launches $REP --limit 20", "every captured launch + its row id -- START HERE"),
     ("summary $REP", "totals: launch / metric / rule / disasm counts, NCU version"),
@@ -1708,24 +1707,29 @@ def format_nsys_block(detail: dict[str, Any]) -> str:
     )
 
 
-# Printed once under whichever captures landed. The blocks above say what landed and where;
-# this says what to do with it, and it is deliberately singular on both counts -- the
-# 2026-07-24 run's members routinely named three bottlenecks and changed four things at
-# once, which makes a regression un-attributable and a win unrepeatable.
+# Printed once, above the capture blocks: the marching order first, then what landed and
+# where. It is deliberately singular on both counts -- the 2026-07-24 run's members
+# routinely named three bottlenecks and changed four things at once, which makes a
+# regression un-attributable and a win unrepeatable.
 #
-# It is also the recency anchor for the verb list, which now sits at the top of a context
-# this fires several thousand tokens into. Naming veloq here is what sends the agent back
-# to it; a score that printed only paths would be pointing at a tool it never mentions.
+# Leading rather than closing puts the instruction before the data it applies to, and the
+# whole score is ~800 chars now, so nothing here is far enough from anything else for
+# recency to decide it. What the position *does* cost is the anchor role: the capture
+# blocks below each name their own `veloq <group>` verbs, so the pointer back to the
+# prompt's verb list survives this being first.
 ANALYSIS_DIRECTIVE = (
-    "Analyze the Nsight Compute and Nsight Systems reports using veloq and identify "
-    "exactly one high impact performance bottleneck. Then, design and implement exactly "
-    "one optimization strategy. Use the CUDA-docs MCP and the vendored ptx-skill to answer "
-    "API and hardware questions."
+    "Analyze the ncu and nsys reports using ncu-profile-analysis, ncu-report-skill, and nsys-profile-analysis skills. "
+    "Design and implement exactly one optimization strategy, targetting exactly one high impact performance bottleneck. "
+    "Use the nvidia-cuda-docs MCP and the vendored ptx-skill to answer API and hardware questions."
 )
 
 
 def format_analysis_directive(detail: dict[str, Any]) -> str:
-    """The marching order under the capture blocks, or '' when nothing was captured."""
+    """The marching order above the capture blocks, or '' when nothing was captured.
+
+    The empty case is the load-bearing one: a score that captured nothing must not open
+    with an instruction to go read reports that are not there.
+    """
     landed = [
         kind
         for kind in ("profile", "nsys")
@@ -1738,7 +1742,15 @@ def format_analysis_directive(detail: dict[str, Any]) -> str:
         text = text.replace(" and Nsight Systems", "")
     elif landed == ["nsys"]:
         text = text.replace("Nsight Compute and ", "")
-    return "--- Next ---\n" + textwrap.fill(text, width=84)
+    # Not wrapped. The reader is a model, not a terminal -- the capture blocks below run
+    # to 111 chars unwrapped -- and every width breaks one of the hyphenated skill names
+    # the directive exists to hand over verbatim (70 splits `ncu-report-skill`, 84
+    # `nvidia-cuda-docs`, 100 `nsys-profile-analysis`).
+    # A noun phrase for what follows, like the capture banners below it -- "Next" named a
+    # position this block no longer holds, now that it opens the score instead of closing
+    # it. Purely a visual section marker: nothing parses it, and the only structure in
+    # this output that is load-bearing is the verdict line _cli_score scans back for.
+    return "--- Task ---\n" + text
 
 
 def score_command(problem: Problem, args: Any) -> int:
@@ -1753,6 +1765,16 @@ def score_command(problem: Problem, args: Any) -> int:
     the JSON by scanning stdout in reverse for the last line starting with ``{``, so
     anything emitted after it would have to be guaranteed brace-free forever. Printing
     first makes that impossible to get wrong.
+
+    ``--brief`` drops ``bench`` and nothing else. That record is the run's forensic
+    archive -- ``_cli_score`` carries it opaquely into ``members/<id>/result.json`` and
+    the journal, and no consumer anywhere reads a field of it -- but it is 98% of the
+    line, and 63% is ``shapes``: fourteen per-shape rows an agent cannot act on, since
+    ``metric_mode = "shape"`` means one index scores. ``profile``/``nsys`` are another
+    20%, repeating paths the banners above already printed. So the caller that archives
+    keeps the default and the caller that *reads* asks for brief -- see
+    ``Orchestrator._score_cmd_str``. Everything an agent acts on survives: a failure's
+    reason is in ``error`` (and on stderr), not in ``bench``.
     """
     correct, metric, err, detail = score(
         problem,
@@ -1760,10 +1782,11 @@ def score_command(problem: Problem, args: Any) -> int:
         test_only=bool(getattr(args, "test_only", False)),
         profile=getattr(args, "profile", None),
     )
+    # Directive first, then the captures it refers to: instruction before data.
     for block in (
+        format_analysis_directive(detail),
         format_profile_block(detail),
         format_nsys_block(detail),
-        format_analysis_directive(detail),
     ):
         if block:
             print(block)
@@ -1772,8 +1795,9 @@ def score_command(problem: Problem, args: Any) -> int:
         "correct": correct,
         "metric": metric,
         "error": err,
-        "bench": detail,
     }
+    if not getattr(args, "brief", False):
+        result["bench"] = detail
     if getattr(args, "emit_baseline", False):
         result["baseline_median"] = None
     print(json.dumps(result))

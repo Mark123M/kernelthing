@@ -85,6 +85,53 @@ def test_both_veloq_skills_are_vendored_and_render_the_same_shape():
         assert "references/limitations.md" in note  # its own References index
 
 
+def test_the_tools_block_is_ordered_turn_loop_then_reference_then_commands():
+    """Section order is a decision, so it needs a test -- appending a new `parts.append`
+    at the bottom of the method is otherwise invisible until someone reads a prompt.
+
+    Three bands: what the agent does every turn, the reference it consults when stuck,
+    then the command surfaces. Commands last is the recency slot, since this block sits
+    immediately above the task. The two backward citations must stay backward --
+    kernel-tools-veloq.md cites "the profiling section above" for the rejected token, and
+    kernel-tools-nsys.md defers to the ncu section on durations-as-ratios.
+    """
+    from kernelthing.config import Config
+    from kernelthing.problem import load_problem
+
+    problem = load_problem(REPO_ROOT / "problems" / "cholesky_b256n128")
+    block = Orchestrator(problem, Config())._kernel_tools_block
+    headings = [ln[4:] for ln in block.splitlines() if ln.startswith("### ")]
+    assert headings == [
+        "Timing",
+        "Profiling",
+        "Rules",
+        "Diagnosing an ncu report — `ncu-profile-analysis`",
+        "B200 profiling reference — `ncu-report-skill`",
+        "Reading an nsys timeline — `nsys-profile-analysis`",
+        "CUDA documentation — the `nvidia-cuda-docs` MCP server",
+        "PTX / CUDA ISA reference — `ptx-skill`",
+        "Reading the Nsight Compute report — `veloq ncu`",
+        "Reading the Nsight Systems timeline — `veloq nsys`",
+        "KernelWiki — Blackwell/Hopper kernel-optimization knowledge base",
+    ]
+    assert block.index("### Profiling") < block.index("### Reading the Nsight Compute")
+    assert block.index("### Reading the Nsight Compute") < block.index(
+        "### Reading the Nsight Systems"
+    )
+
+
+def test_the_dump_renders_the_sections_in_the_order_candidates_get_them():
+    """A dump that reordered them would document a prompt no candidate receives."""
+    from kernelthing.config import Config
+    from kernelthing.dump_prompts import render_kernel_tools
+    from kernelthing.problem import load_problem
+
+    cfg = Config()
+    live = Orchestrator(load_problem(REPO_ROOT / "problems" / "cholesky_b256n128"), cfg)
+    heads = lambda text: [ln for ln in text.splitlines() if ln.startswith("### ")]  # noqa: E731
+    assert heads(render_kernel_tools(cfg)) == heads(live._kernel_tools_block)
+
+
 def test_every_skill_section_renders_through_one_template():
     """Four vendored skills, one heading shape. Drifting formats is what the shared
     template prevents; an absent tree drops the whole section, heading included."""

@@ -179,6 +179,8 @@ def score_command(argv: list[str]) -> int:
     hosted popcorn service and the returned numbers are parsed (see popcorn.py).
     There is no local GPU step, and no other backend is supported.
     """
+    from .dryrun import SCENARIOS as DRY_RUN_SCENARIOS
+
     p = argparse.ArgumentParser(
         prog="kernelthing score",
         description="Score a problem dir on the hosted popcorn service and print "
@@ -209,6 +211,32 @@ def score_command(argv: list[str]) -> int:
         default=None,
         help="skip the automatic Nsight Compute and Nsight Systems captures",
     )
+    # `bench` is the forensic record: the orchestrator archives it into result.json and
+    # the journal, and nothing reads a field of it. It is also 98% of the line, so the
+    # caller that only wants the verdict should not have to read it. Agents get --brief
+    # baked into their scoring command (Orchestrator._score_cmd_str); the default is
+    # unchanged, so _cli_score and anyone debugging by hand still archive everything.
+    p.add_argument(
+        "--brief",
+        action="store_true",
+        default=False,
+        help="print {unit, correct, metric, error} without the bench record "
+        "(~75 chars instead of ~4000); the profile banners are unaffected",
+    )
+    # The one thing about a score that cannot be inspected without paying for it is what
+    # it prints -- and that text is the loop's tightest feedback channel. See dryrun.py.
+    p.add_argument(
+        "--dry-run",
+        nargs="?",
+        const="ok",
+        default=None,
+        choices=DRY_RUN_SCENARIOS,
+        metavar="SCENARIO",
+        help="submit nothing: replay a score from the captures in tests/fixtures/popcorn "
+        "and print exactly what an agent would read. SCENARIO is one of "
+        f"{', '.join(DRY_RUN_SCENARIOS)} (default: ok); --test-only and --no-profile "
+        "apply as usual.",
+    )
     args = p.parse_args(argv)
 
     try:
@@ -222,6 +250,10 @@ def score_command(argv: list[str]) -> int:
     if (problem.bench or {}).get("backend") == "popcorn":
         from . import popcorn
 
+        if args.dry_run:
+            from . import dryrun
+
+            return dryrun.score_command(problem, args)
         return popcorn.score_command(problem, args)
 
     print(

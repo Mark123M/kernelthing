@@ -988,7 +988,9 @@ def test_a_score_prints_where_the_captures_landed_and_nothing_static(
     # ...above the verdict: _cli_score scans stdout in reverse for the last '{' line
     assert out.index("Nsight Compute capture") < out.index('"correct"')
     assert out.index("Nsight Systems timeline") < out.index('"correct"')
-    assert out.index("--- Next ---") < out.index('"correct"')
+    assert out.index("--- Task ---") < out.index('"correct"')
+    # ...and the directive leads, so the instruction precedes the data it applies to
+    assert out.index("--- Task ---") < out.index("Nsight Compute capture")
 
 
 def test_each_reports_prompt_section_carries_its_own_verbs():
@@ -1060,9 +1062,9 @@ def test_the_score_points_back_at_the_verbs_it_no_longer_prints():
     detail = {"profile": _ok_profile().record(), "nsys": _ok_nsys().record()}
     both = "\n".join(
         (
+            popcorn.format_analysis_directive(detail),
             popcorn.format_profile_block(detail),
             popcorn.format_nsys_block(detail),
-            popcorn.format_analysis_directive(detail),
         )
     )
     assert "veloq ncu" in both and "veloq nsys" in both
@@ -1084,18 +1086,26 @@ def test_the_score_ends_by_asking_for_one_bottleneck_and_one_change(tmp_path, mo
     out = " ".join(capsys.readouterr().out.split())
     assert "exactly one high impact performance bottleneck" in out
     assert "exactly one optimization strategy" in out
-    assert "CUDA-docs MCP" in out and "ptx-skill" in out
+    assert "nvidia-cuda-docs MCP" in out and "ptx-skill" in out
 
 
-def test_the_directive_names_only_the_reports_that_landed():
-    """Pointing at an Nsight Systems report that failed to capture is how an agent burns
-    a turn proving the file is not there."""
-    ncu_only = popcorn.format_analysis_directive({"profile": _ok_profile().record()})
-    assert "Nsight Compute" in ncu_only and "Nsight Systems" not in ncu_only
-    nsys_only = popcorn.format_analysis_directive({"nsys": _ok_nsys().record()})
-    assert "Nsight Systems" in nsys_only and "Nsight Compute" not in nsys_only
+def test_the_directive_leads_the_score_and_is_dropped_when_nothing_landed():
+    """A score that captured nothing must not open by telling the agent to go read
+    reports that are not there -- the empty case is what makes leading safe.
+
+    NB the per-report narrowing below it is currently inert: ``ANALYSIS_DIRECTIVE``'s
+    wording no longer contains the ``" and Nsight Systems"`` / ``"Nsight Compute and "``
+    substrings ``format_analysis_directive`` replaces, so a one-capture score still names
+    both. Re-pointing those two replacements at the current wording is the fix.
+    """
+    # Unwrapped, so the hyphenated skill names it hands over survive intact -- every
+    # textwrap width broke one of them.
+    assert "\n" not in popcorn.ANALYSIS_DIRECTIVE
     dead = popcorn.Profile(ok=False, error="brev queue timeout")
     assert popcorn.format_analysis_directive({"profile": dead.record()}) == ""
+    assert popcorn.format_analysis_directive({}) == ""
+    landed = {"profile": _ok_profile().record(), "nsys": _ok_nsys().record()}
+    assert popcorn.format_analysis_directive(landed).startswith("--- Task ---")
 
 
 def test_the_flat_text_view_is_the_fallback_when_the_report_cannot_be_queried(monkeypatch):

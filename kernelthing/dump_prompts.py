@@ -212,24 +212,6 @@ def render_kernel_tools(cfg: Config) -> str:
     """Render kernel tooling blocks for dump mode, assuming enabled tools work."""
 
     parts: list[str] = []
-    if cfg.wiki:
-        parts.append(
-            prompts.load_and_render_safe(
-                "claude/kernel-tools-wiki.md",
-                "",
-                PYTHON="{{PYTHON}}",
-                WIKI_DIR="{{WIKI_DIR}}",
-            )
-        )
-
-    parts.append(
-        prompts.load_and_render_safe(
-            "claude/kernel-tools-profile.md",
-            "",
-            SUBMISSION_FILE="{{SUBMISSION_FILE}}",
-            SCORE_CMD="{{SCORE_CMD}}",
-        )
-    )
 
     def skill(title: str, note: str, tree: str, placeholder: str) -> str:
         # Same headed-section template the orchestrator uses, with the absolute vendor
@@ -239,17 +221,18 @@ def render_kernel_tools(cfg: Config) -> str:
             title, note.replace(str(REPO_ROOT / "vendor" / tree), placeholder)
         )
 
-    if cfg.veloq:
-        parts.append(
-            prompts.load_and_render_safe(
-                "claude/kernel-tools-veloq.md",
-                "",
-                VELOQ_BIN="{{VELOQ_BIN}}",
-                REPORT="{{REPORT}}",
-                NCU_VERBS=popcorn.veloq_verb_block("ncu"),
-                SUBMISSION_FILE="{{SUBMISSION_FILE}}",
-            )
+    # Band order mirrors _kernel_tools_block exactly (turn loop -> reference -> commands);
+    # a dump that reordered them would be a dump of a prompt no candidate receives.
+    parts.append(
+        prompts.load_and_render_safe(
+            "claude/kernel-tools-profile.md",
+            "",
+            SUBMISSION_FILE="{{SUBMISSION_FILE}}",
+            SCORE_CMD="{{SCORE_CMD}}",
         )
+    )
+
+    if cfg.veloq:
         parts.append(
             skill(
                 "Diagnosing an ncu report — `ncu-profile-analysis`",
@@ -269,25 +252,27 @@ def render_kernel_tools(cfg: Config) -> str:
             )
         )
 
-    # Dump mode assumes every enabled tool works, so unlike the orchestrator this is not
-    # also gated on the problem's bench.popcorn.nsys -- a dump is of the configuration,
-    # not of one problem's capture plan.
+    # Dump mode assumes every enabled tool works, so unlike the orchestrator the nsys
+    # sections are not also gated on the problem's bench.popcorn.nsys -- a dump is of the
+    # configuration, not of one problem's capture plan.
     if cfg.veloq:
-        parts.append(
-            prompts.load_and_render_safe(
-                "claude/kernel-tools-nsys.md",
-                "",
-                VELOQ_BIN="{{VELOQ_BIN}}",
-                NSYS_REPORT="{{NSYS_REPORT}}",
-                NSYS_VERBS=popcorn.veloq_verb_block("nsys"),
-            )
-        )
         parts.append(
             skill(
                 "Reading an nsys timeline — `nsys-profile-analysis`",
                 Orchestrator._veloq_ref_note(REPO_ROOT / "vendor" / "veloq-nsys-skill"),
                 "veloq-nsys-skill",
                 "{{NSYS_SKILL_DIR}}",
+            )
+        )
+
+    if cfg.mcp_cuda_docs:
+        parts.append(
+            prompts.load_and_render_safe(
+                "claude/kernel-tools-cuda-docs.md",
+                "",
+                MCP_SERVER=opencode_client.CUDA_DOCS_MCP_SERVER,
+                MCP_TOOL=opencode_client.CUDA_DOCS_MCP_TOOL,
+                MCP_DESCRIPTION=opencode_client.CUDA_DOCS_MCP_INSTRUCTIONS,
             )
         )
 
@@ -302,14 +287,34 @@ def render_kernel_tools(cfg: Config) -> str:
         )
     )
 
-    if cfg.mcp_cuda_docs:
+    if cfg.veloq:
         parts.append(
             prompts.load_and_render_safe(
-                "claude/kernel-tools-cuda-docs.md",
+                "claude/kernel-tools-veloq.md",
                 "",
-                MCP_SERVER=opencode_client.CUDA_DOCS_MCP_SERVER,
-                MCP_TOOL=opencode_client.CUDA_DOCS_MCP_TOOL,
-                MCP_DESCRIPTION=opencode_client.CUDA_DOCS_MCP_INSTRUCTIONS,
+                VELOQ_BIN="{{VELOQ_BIN}}",
+                REPORT="{{REPORT}}",
+                NCU_VERBS=popcorn.veloq_verb_block("ncu"),
+                SUBMISSION_FILE="{{SUBMISSION_FILE}}",
+            )
+        )
+        parts.append(
+            prompts.load_and_render_safe(
+                "claude/kernel-tools-nsys.md",
+                "",
+                VELOQ_BIN="{{VELOQ_BIN}}",
+                NSYS_REPORT="{{NSYS_REPORT}}",
+                NSYS_VERBS=popcorn.veloq_verb_block("nsys"),
+            )
+        )
+
+    if cfg.wiki:
+        parts.append(
+            prompts.load_and_render_safe(
+                "claude/kernel-tools-wiki.md",
+                "",
+                PYTHON="{{PYTHON}}",
+                WIKI_DIR="{{WIKI_DIR}}",
             )
         )
     return Orchestrator._tools_section(parts)
