@@ -6,6 +6,8 @@
 profile/
 profile.*/
 *.ncu-rep
+*.nsys-rep
+*.sqlite*
 *.zip
 
 # Archived run artifacts. Most of the weight is members/*/opencode.ndjson (13M of

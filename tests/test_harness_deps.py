@@ -207,6 +207,10 @@ _SCORER_ARTIFACTS = (
     "profile/latest/digest.txt",
     "profile/latest/profile.ncu-rep",
     "profile/latest/profile.ncu-rep.veloq/ncu-native.json.gz",
+    "profile/latest/nsys/profile.nsys-rep",
+    "profile/latest/nsys/profile.sqlite",
+    "profile/latest/nsys/profile.sqlite-journal",
+    "profile/latest/nsys/stats.txt",
 )
 
 # popcorn names the extracted capture after the shape, at the cwd it ran in. The scorer
@@ -219,8 +223,13 @@ _ARTIFACTS = (
     "profile.2-batch-256-n-128-cond-2-seed-41128/ncu-details.txt",
     "profile.2-batch-256-n-128-cond-2-seed-41128/profile.ncu-rep",
     "profile.2-batch-256-n-128-cond-2-seed-41128/profile.ncu-rep.veloq/ncu-native.json.gz",
+    "profile.2-batch-256-n-128-cond-2-seed-41128/profile.nsys-rep",
+    "profile.2-batch-256-n-128-cond-2-seed-41128/profile.sqlite",
     "profile.2-batch-256-n-128-cond-2-seed-41128.zip",
     "profile/brev.json",
+    "manual.nsys-rep",
+    "manual.sqlite",
+    "manual.sqlite-journal",
 )
 
 

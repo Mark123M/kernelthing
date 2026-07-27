@@ -17,11 +17,11 @@ Scoring is two remote submissions, in order:
   1. ``popcorn submit --mode test``      -- correctness over the public test shapes.
   2. ``popcorn submit --mode benchmark`` -- timings; only reached if (1) passed.
 
-...plus a third, ``--profile-brev``, fired *concurrently with* (2) the moment (1) passes.
-See ``profile_submission``: it is a different service on a different endpoint, so it
-cannot be folded into a submission, but it can overlap one. Overlapping is the whole
-trick -- the profile is the long pole (245-270s alone, more behind the queue) and the
-benchmark is ~172s, so running them together costs the difference rather than the sum.
+...plus two profilers fired *concurrently with* (2) the moment (1) passes: hosted
+Nsight Compute via ``--profile-brev`` and a minimal Modal/B200 Nsight Systems
+capture. See ``profile_submission`` and ``profile_nsys_submission``. Overlapping is
+the whole trick -- the profile jobs are the long pole and the benchmark is ~172s,
+so running them together costs the difference rather than the sum.
 
 Splitting them is what makes a broken kernel cheap: ``test`` runs small shapes and
 returns fast, so most failures never pay for a benchmark. ``benchmark`` re-checks every
@@ -111,6 +111,7 @@ MODE_BENCHMARK = "benchmark"
 MODE_LEADERBOARD = "leaderboard"
 # Not a submission mode: --profile-brev is its own service (see profile_submission).
 MODE_PROFILE = "profile"
+MODE_NSYS = "nsys"
 
 # The profile runs concurrently with the timing submission, so this cap does not add to
 # the budget -- the pair costs max(timeout_s, PROFILE_TIMEOUT_S), and holding them equal
@@ -128,6 +129,8 @@ PROFILE_TIMEOUT_S = 1200
 # worktree, so an agent's own `kernelthing score` could not write there.
 PROFILE_DIR = "profile"
 PROFILE_SUBDIR = "latest"
+NSYS_SUBDIR = "nsys"
+NSYS_STATS_MAX_CHARS = 12_000
 
 # ncu-details.txt sections worth quoting back in full. The rule findings (OPT/INF/WRN)
 # are always kept and are what actually names a bottleneck; these three carry the numbers
@@ -213,6 +216,10 @@ class PopcornConfig:
     # point is that an agent never has to decide to profile, so it never reasons about a
     # bottleneck it did not measure.
     profile: bool = True
+    # Capture an Nsight Systems timeline on Modal/B200 alongside the same full score.
+    # Separate from ``profile`` so operators can keep the existing ncu path without
+    # Modal, or vice versa. ``kernelthing score --no-profile`` still disables both.
+    nsys: bool = True
 
     @property
     def timing_mode(self) -> str:
@@ -314,6 +321,7 @@ def resolve_config(problem: Problem) -> PopcornConfig:
         cache=bool(raw.get("cache", True)),
         bin=str(raw.get("bin", "")),
         profile=bool(raw.get("profile", True)),
+        nsys=bool(raw.get("nsys", True)),
     )
 
 
@@ -344,6 +352,14 @@ def popcorn_bin(cfg: PopcornConfig | None = None) -> str:
     if override:
         return override
     return shutil.which("popcorn") or shutil.which("popcorn-cli") or ""
+
+
+def modal_bin() -> str:
+    """Path to the Modal CLI, or '' when nsys profiling cannot be started."""
+    override = os.environ.get("KERNELTHING_MODAL_BIN", "").strip()
+    if override:
+        return override
+    return shutil.which("modal") or ""
 
 
 def api_base() -> str:
@@ -845,6 +861,31 @@ class Profile:
         return d
 
 
+@dataclass
+class NsysProfile:
+    """One Modal/B200 Nsight Systems capture, as far as the scorer is concerned."""
+
+    ok: bool = False
+    report_path: str = ""  # profile.nsys-rep, for the GUI
+    sqlite_path: str = ""  # profile.sqlite, for nsys stats / sqlite inspection
+    stats_path: str = ""  # stats.txt, what score_command echoes in compact form
+    wall_s: float = 0.0
+    cached: bool = False
+    error: str = ""
+
+    def record(self) -> dict[str, Any]:
+        """The verdict's ``bench.nsys`` entry: status and paths, never stats text."""
+        d: dict[str, Any] = {"ok": self.ok, "wall_s": round(self.wall_s, 1)}
+        if self.cached:
+            d["cached"] = True
+        for key in ("report_path", "sqlite_path", "stats_path"):
+            if getattr(self, key):
+                d[key] = getattr(self, key)
+        if self.error:
+            d["error"] = self.error[:500]
+        return d
+
+
 def brev_defuse(text: str, cfg: PopcornConfig) -> str:
     """Break any evaluator-rejected substring in profiler output before an agent sees it.
 
@@ -950,6 +991,33 @@ def _profile_cache_store(cfg: PopcornConfig, digest: str, details: str) -> None:
         pass
 
 
+def _nsys_cache_path(cfg: PopcornConfig, digest: str) -> Path:
+    return _cache_root() / cfg.leaderboard / cfg.gpu / MODE_NSYS / f"{digest}.txt"
+
+
+def _nsys_cache_load(cfg: PopcornConfig, digest: str) -> str:
+    """The cached ``nsys stats`` text for this exact submission, or ''."""
+    if not cfg.cache:
+        return ""
+    try:
+        return _nsys_cache_path(cfg, digest).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _nsys_cache_store(cfg: PopcornConfig, digest: str, stats: str) -> None:
+    if not cfg.cache or not stats.strip():
+        return
+    path = _nsys_cache_path(cfg, digest)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".txt.tmp")
+        tmp.write_text(stats, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def _find_capture(root: Path) -> Path | None:
     """The ``profile.<index>-<spec-slug>/`` directory the CLI extracted, if any."""
     for child in sorted(root.glob("profile.*")):
@@ -1045,6 +1113,138 @@ def profile_submission(cfg: PopcornConfig, sub_path: Path, dest: Path, digest: s
     return prof
 
 
+def _cholesky_nsys_args(cfg: PopcornConfig) -> tuple[int, int, int]:
+    """Return ``(batch, n, seed)`` for the Modal nsys harness, or raise."""
+    if cfg.leaderboard != "cholesky":
+        raise PopcornError(
+            f"Nsight Systems Modal profiling supports only cholesky in v1, not {cfg.leaderboard}"
+        )
+    fields = spec_fields(cfg.benchmark_spec)
+    missing = [name for name in ("batch", "n", "seed") if not fields.get(name)]
+    if missing:
+        raise PopcornError(
+            "Nsight Systems Modal profiling requires benchmark_spec fields: "
+            + ", ".join(missing)
+        )
+    try:
+        batch = int(fields["batch"])
+        n = int(fields["n"])
+        seed = int(fields["seed"])
+    except ValueError as e:
+        raise PopcornError(
+            "Nsight Systems Modal profiling requires integer batch, n, and seed "
+            f"in benchmark_spec: {cfg.benchmark_spec}"
+        ) from e
+    if batch <= 0 or n <= 0:
+        raise PopcornError(
+            "Nsight Systems Modal profiling requires positive batch and n "
+            f"in benchmark_spec: {cfg.benchmark_spec}"
+        )
+    return batch, n, seed
+
+
+def profile_nsys_submission(
+    cfg: PopcornConfig,
+    sub_path: Path,
+    dest: Path,
+    digest: str,
+) -> NsysProfile:
+    """Capture one Modal/B200 Nsight Systems timeline of the scored Cholesky shape."""
+    prof = NsysProfile()
+    cached = _nsys_cache_load(cfg, digest)
+    if cached:
+        prof.cached = True
+        _land_nsys(prof, dest, cached, cfg)
+        if not prof.ok:
+            prof.error = f"could not write cached Nsight Systems stats under {dest}"
+        return prof
+
+    try:
+        batch, n, seed = _cholesky_nsys_args(cfg)
+    except PopcornError as e:
+        prof.error = str(e)
+        return prof
+
+    exe = modal_bin()
+    if not exe:
+        prof.error = "Modal CLI not found on PATH (set KERNELTHING_MODAL_BIN)"
+        return prof
+    script = Path(__file__).resolve().with_name("nsys_modal.py")
+    if not script.is_file():
+        prof.error = f"Nsight Systems Modal runner missing: {script}"
+        return prof
+
+    print(
+        f"profiling benchmark index {cfg.benchmark_index} with Nsight Systems on Modal/B200 "
+        "(minutes; runs alongside the timing submission)...",
+        file=sys.stderr,
+    )
+    cmd = [
+        exe,
+        "run",
+        str(script),
+        "--submission",
+        str(sub_path.resolve()),
+        "--output",
+        str(dest),
+        "--batch",
+        str(batch),
+        "--n",
+        str(n),
+        "--seed",
+        str(seed),
+        "--digest",
+        digest,
+    ]
+    t0 = time.time()
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=PROFILE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        prof.wall_s = time.time() - t0
+        prof.error = f"Nsight Systems profile timed out after {PROFILE_TIMEOUT_S}s"
+        return prof
+    except OSError as e:
+        prof.wall_s = time.time() - t0
+        prof.error = f"Nsight Systems profile could not start: {e}"
+        return prof
+    prof.wall_s = time.time() - t0
+    if r.returncode != 0:
+        tail = ((r.stderr or "") + (r.stdout or "")).strip()[-500:]
+        prof.error = f"Nsight Systems profile failed (exit {r.returncode}): {tail}"
+        return prof
+
+    report_path = dest / "profile.nsys-rep"
+    sqlite_path = dest / "profile.sqlite"
+    stats_path = dest / "stats.txt"
+    missing = [
+        str(path)
+        for path in (report_path, sqlite_path, stats_path)
+        if not path.is_file() or path.stat().st_size == 0
+    ]
+    if missing:
+        prof.error = f"Nsight Systems profile produced missing/empty artifacts: {missing}"
+        return prof
+
+    try:
+        stats = stats_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        prof.error = f"Nsight Systems stats not readable: {e}"
+        return prof
+    _land_nsys(prof, dest, stats, cfg)
+    if prof.ok:
+        prof.report_path = str(report_path)
+        prof.sqlite_path = str(sqlite_path)
+        with contextlib.suppress(OSError):
+            _nsys_cache_store(
+                cfg,
+                digest,
+                stats_path.read_text(encoding="utf-8", errors="replace"),
+            )
+    else:
+        prof.error = prof.error or f"could not write Nsight Systems stats under {dest}"
+    return prof
+
+
 def _land(prof: Profile, dest: Path, details: str, cfg: PopcornConfig) -> None:
     """Write the capture and its digest into ``dest`` and fill in ``prof``.
 
@@ -1068,6 +1268,21 @@ def _land(prof: Profile, dest: Path, details: str, cfg: PopcornConfig) -> None:
             digest_path = dest / "digest.txt"
             digest_path.write_text(prof.digest + "\n", encoding="utf-8")
             prof.digest_path = str(digest_path)
+
+
+def _land_nsys(prof: NsysProfile, dest: Path, stats: str, cfg: PopcornConfig) -> None:
+    """Write nsys stats into ``dest`` and fill in ``prof``."""
+    stats = brev_defuse(stats, cfg).strip()
+    if not stats:
+        return
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        stats_path = dest / "stats.txt"
+        stats_path.write_text(stats + "\n", encoding="utf-8")
+        prof.stats_path = str(stats_path)
+        prof.ok = True
+    except OSError:
+        return
 
 
 def _precheck(cfg: PopcornConfig, source: str) -> str | None:
@@ -1178,20 +1393,21 @@ def score(
     so ``cli.score_command`` can emit an identical verdict either way. ``metric`` is in
     microseconds and lower is better, so a popcorn problem sets ``direction: minimize``.
 
-    ``profile`` overrides ``bench.popcorn.profile`` (``None`` defers to it, and is what
-    the CLI passes unless ``--no-profile`` was given). When on, a hosted Nsight Compute
-    capture is started as soon as the test submission passes and joined after the timing
-    submission returns, so the two overlap; the capture lands in
-    ``<worktree>/profile/latest/`` and its paths land in ``detail["profile"]``.
+    ``profile`` overrides the automatic profilers (``None`` defers to the manifest, and
+    is what the CLI passes unless ``--no-profile`` was given). When on, a hosted Nsight
+    Compute capture and, when configured, a Modal/B200 Nsight Systems capture are started
+    as soon as the test submission passes and joined after the timing submission returns,
+    so all three overlap; captures land in ``<worktree>/profile/latest/`` and their
+    paths land in ``detail["profile"]`` / ``detail["nsys"]``.
 
     Starting it at test-pass rather than at entry is the one place this is *not* maximally
     concurrent, and deliberately: overlapping the test as well would buy ~10s, while a
     kernel that fails correctness would already have taken a ~300s slot in a queue that
     runs one job at a time.
 
-    A profile is never allowed to affect the verdict. It is fired only after correctness
-    is established, its failures are recorded rather than raised, and it is joined in a
-    ``finally`` so an exception on the timing path cannot leak the thread.
+    A profile is never allowed to affect the verdict. Profilers fire only after
+    correctness is established, their failures are recorded rather than raised, and they
+    are joined in a ``finally`` so an exception on the timing path cannot leak a thread.
     """
     try:
         cfg = resolve_config(problem)
@@ -1236,18 +1452,32 @@ def score(
     # ~25x slower -- and nothing to reason about either, since --test-only produces no
     # timing. That is the call an agent iterating on correctness makes most often, and
     # keeping it cheap is what stops it from being avoided.
-    want_profile = (cfg.profile and not test_only) if profile is None else profile
+    want_profile = (cfg.profile and not test_only) if profile is None else bool(profile)
+    want_nsys = (cfg.nsys and not test_only) if profile is None else (bool(profile) and cfg.nsys)
     pool: ThreadPoolExecutor | None = None
-    pending: Any = None  # Future[Profile], typed loosely to keep the import surface small
+    pending_profile: Any = None  # Future[Profile], typed loosely to keep imports small
+    pending_nsys: Any = None  # Future[NsysProfile]
 
-    def start_profile() -> None:
-        """Kick off the capture in the background. Called once correctness is known."""
-        nonlocal pool, pending
-        if not want_profile or pending is not None:
+    def start_profiles() -> None:
+        """Kick off captures in the background. Called once correctness is known."""
+        nonlocal pool, pending_profile, pending_nsys
+        if pending_profile is not None or pending_nsys is not None:
+            return
+        workers = int(bool(want_profile)) + int(bool(want_nsys))
+        if workers <= 0:
             return
         dest = Path(worktree) / problem.rel_dir / PROFILE_DIR / PROFILE_SUBDIR
-        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kt-profile")
-        pending = pool.submit(profile_submission, cfg, sub_path, dest, digest)
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="kt-profile")
+        if want_profile:
+            pending_profile = pool.submit(profile_submission, cfg, sub_path, dest, digest)
+        if want_nsys:
+            pending_nsys = pool.submit(
+                profile_nsys_submission,
+                cfg,
+                sub_path,
+                dest / NSYS_SUBDIR,
+                digest,
+            )
 
     try:
         test_sub = run(MODE_TEST)
@@ -1270,12 +1500,10 @@ def score(
             )
             return False, None, _test_error(report, total), detail
 
-        # Correctness is established, so the kernel is worth measuring. Start the capture
-        # *here*, before the timing submission, so the two run together: the profile is
-        # the long pole (245s+) and the benchmark is ~172s, so overlapping them costs the
-        # difference instead of the sum. A broken kernel never reaches this line and so
-        # never spends a slot in the profiler's queue.
-        start_profile()
+        # Correctness is established, so the kernel is worth measuring. Start the
+        # profilers *here*, before the timing submission, so all three run together. A
+        # broken kernel never reaches this line and so never spends a profiler slot.
+        start_profiles()
         if test_only:
             detail.update(
                 {"wall_s": wall, "submission_ids": ids, "cached": cached, "source": sources}
@@ -1314,9 +1542,9 @@ def score(
         # re-check failure, PopcornError -- reclaims the thread and reports what the
         # capture did. ``detail`` is returned by reference, so mutating it after the
         # return expression has been evaluated still reaches the caller.
-        if pending is not None:
+        if pending_profile is not None:
             try:
-                prof: Profile = pending.result()
+                prof: Profile = pending_profile.result()
             except Exception as e:  # a capture must never fail a score
                 # profile_submission handles its own expected failures; this catches the
                 # unexpected ones. Raising here would happen *inside* finally, replacing
@@ -1324,6 +1552,12 @@ def score(
                 # could still change whether a kernel scored.
                 prof = Profile(error=f"{type(e).__name__}: {e}"[:500])
             detail["profile"] = prof.record()
+        if pending_nsys is not None:
+            try:
+                nsys_prof: NsysProfile = pending_nsys.result()
+            except Exception as e:
+                nsys_prof = NsysProfile(error=f"{type(e).__name__}: {e}"[:500])
+            detail["nsys"] = nsys_prof.record()
         if pool is not None:
             pool.shutdown(wait=True)
 
@@ -1365,6 +1599,50 @@ def format_profile_block(detail: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def nsys_stats_digest(stats: str) -> str:
+    """Keep the nsys stats block readable in a score transcript."""
+    text = stats.strip()
+    if len(text) <= NSYS_STATS_MAX_CHARS:
+        return text
+    return text[:NSYS_STATS_MAX_CHARS].rstrip() + "\n... truncated ..."
+
+
+def format_nsys_block(detail: dict[str, Any]) -> str:
+    """The Nsight Systems section ``score_command`` prints above the verdict, or ''."""
+    prof = detail.get("nsys")
+    if not isinstance(prof, dict):
+        return ""
+    if not prof.get("ok"):
+        reason = str(prof.get("error") or "unknown")
+        return f"--- Nsight Systems profile unavailable: {reason} ---"
+    stats_path = str(prof.get("stats_path") or "")
+    body = ""
+    if stats_path:
+        with contextlib.suppress(OSError):
+            body = nsys_stats_digest(
+                Path(stats_path).read_text(encoding="utf-8", errors="replace")
+            )
+    lines = [
+        "--- Nsight Systems timeline of the scored shape "
+        + ("(cached: identical submission) " if prof.get("cached") else "")
+        + "---",
+        "Captured on Modal/B200 after one warmup call. Use this for launch order,",
+        "CUDA API overhead, memcpy/kernel balance and gaps; only the scorer metric",
+        "is the authoritative timing.",
+        "",
+    ]
+    if body:
+        lines += [body, ""]
+    if prof.get("stats_path"):
+        lines.append(f"Stats summary: {prof['stats_path']}")
+    if prof.get("sqlite_path"):
+        lines.append(f"SQLite export: {prof['sqlite_path']}")
+    if prof.get("report_path"):
+        lines.append(f"GUI report: {prof['report_path']}")
+    lines.append("--- end nsys profile ---")
+    return "\n".join(lines)
+
+
 def score_command(problem: Problem, args: Any) -> int:
     """``kernelthing score`` for a popcorn-backed problem: print the verdict JSON line.
 
@@ -1384,9 +1662,9 @@ def score_command(problem: Problem, args: Any) -> int:
         test_only=bool(getattr(args, "test_only", False)),
         profile=getattr(args, "profile", None),
     )
-    block = format_profile_block(detail)
-    if block:
-        print(block)
+    for block in (format_profile_block(detail), format_nsys_block(detail)):
+        if block:
+            print(block)
     result: dict[str, Any] = {
         "unit": problem.unit,
         "correct": correct,

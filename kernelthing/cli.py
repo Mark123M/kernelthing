@@ -207,7 +207,7 @@ def score_command(argv: list[str]) -> int:
         dest="profile",
         action="store_false",
         default=None,
-        help="skip the Nsight Compute capture this score would otherwise take",
+        help="skip the automatic Nsight Compute and Nsight Systems captures",
     )
     args = p.parse_args(argv)
 
@@ -474,6 +474,10 @@ def main(argv: list[str] | None = None) -> int:
         return archive_command(argv[1:])
     if argv and argv[0] == "transcripts":
         return transcripts_command(argv[1:])
+    if argv and argv[0] in ("dump-prompts", "dump_prompts"):
+        from . import dump_prompts
+
+        return dump_prompts.command(argv[1:])
 
     parser = argparse.ArgumentParser(
         prog="kernelthing",
@@ -491,7 +495,9 @@ def main(argv: list[str] | None = None) -> int:
         "  transcripts     render every agent's full conversation (prompt, text,\n"
         "                  reasoning, tool calls with complete I/O) to markdown;\n"
         "                  archiving already does this, so this is for live runs\n"
-        "                  and re-renders",
+        "                  and re-renders\n"
+        "  dump-prompts    dump the candidate prompt stack for explore/exploit turns\n"
+        "                  without calling the model provider",
     )
     parser.add_argument(
         "problem",

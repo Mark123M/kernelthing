@@ -188,11 +188,12 @@ Consequences worth knowing before editing it:
 - Scoring is **two** submissions — `--mode test`, then `--mode benchmark` only if test passed. A
   broken kernel never pays for a benchmark. `correct` is the conjunction: benchmark re-checks every
   shape, so a kernel that only breaks at scale still fails.
-- **...plus an Nsight Compute capture, fired the moment the test passes and joined after the
-  benchmark returns** (`profile_submission`, `PROFILE_TIMEOUT_S`). Agents no longer decide to
-  profile; every full score arrives with one. Details in "Automatic profiling" below.
+- **...plus Nsight Compute and Nsight Systems captures, fired the moment the test passes and joined
+  after the benchmark returns** (`profile_submission`, `profile_nsys_submission`,
+  `PROFILE_TIMEOUT_S`). Agents no longer decide to profile; every full score arrives with both when
+  configured. Details in "Automatic profiling" below.
 - **Nothing local touches a GPU.** `kernelthing score` takes `[dir]`, `--test-only` and
-  `--profile`/`--no-profile`; there is no `--gpu` / baseline plumbing. The metric is an absolute
+  `--no-profile`; there is no `--gpu` / baseline plumbing. The metric is an absolute
   time, so there is no baseline to pin — `_evolve_seed` scores the seed once and moves on.
 - The metric is a **time in microseconds, so these problems set `direction: minimize`.**
   `bench.popcorn.metric_mode` picks *which* time: `shape` (one `benchmark_index`, the default — a
@@ -227,12 +228,13 @@ Consequences worth knowing before editing it:
   seed half the time.
 - **Three timeout budgets** (`TEST_TIMEOUT_S` 300, `timeout_s` 1200, `PROFILE_TIMEOUT_S` 1200).
   Measured: test 11s, benchmark 275s over 15 shapes; the server caps a shape at 180s so a slow
-  kernel can approach 2700s. The profile runs *concurrently* with the benchmark, so the pair costs
-  `max(timeout_s, PROFILE_TIMEOUT_S)` — keep those two equal and the total stays 300 + 1200, under
-  `_cli_score`'s 1800s kill of the whole scoring process. Raise either alone and it starts killing
-  scores mid-poll.
+  kernel can approach 2700s. The profiles run *concurrently* with the benchmark, so the group costs
+  `max(timeout_s, PROFILE_TIMEOUT_S)` after test — keep those two equal and the total stays
+  300 + 1200, under `_cli_score`'s 1800s kill of the whole scoring process. Raise either alone and
+  it starts killing scores mid-poll.
 - Submissions are **cached on the submission file's sha256** (`_cache_path`; captures separately in
-  `_profile_cache_path`). `KERNELTHING_POPCORN_CACHE` relocates it, `KERNELTHING_POPCORN_BIN`
+  `_profile_cache_path` / `_nsys_cache_path`). `KERNELTHING_POPCORN_CACHE` relocates it,
+  `KERNELTHING_POPCORN_BIN`
   overrides the binary (tests point it at a stub). **The cache is read-only to agents**: bwrap
   ro-binds everything but the worktree, so an agent's own `kernelthing score` loads from it and
   silently fails to store (`_cache_store` swallows the `OSError` by design). Only the orchestrator's
@@ -281,7 +283,7 @@ Consequences worth knowing before editing it:
   them. `torch`/`numpy` are deliberately absent, which is why agents that try a local sanity check
   hit `ModuleNotFoundError` instead of a wrong answer — a good failure, worth keeping.
 
-### Automatic profiling (`popcorn.profile_submission`, `profile_digest`)
+### Automatic profiling (`popcorn.profile_submission`, `profile_nsys_submission`)
 
 Profiling used to be an option in the agent's prompt, and the 2026-07-24 run measured what that
 cost: of 25 members, **15 tried it and 12 got a capture**. Four were killed by opencode's bash
@@ -291,30 +293,37 @@ kill still pays: the brev job runs to completion server-side and the CLI downloa
 after it sees `succeeded`. Three more members lost turns to the `workdir` trap.
 
 So the harness takes it. `bench.popcorn.profile` (default **true**) makes every full score capture
-the scored shape:
+hosted Nsight Compute for the scored shape, and `bench.popcorn.nsys` (default **true**) also starts
+a minimal Modal/B200 Nsight Systems timeline for Cholesky problems:
 
-- **Fired at test-pass, joined after the benchmark** — the two overlap. The profile is the long
-  pole (245–270s alone, 515s observed behind a queue) and the benchmark is ~172s, so overlapping
-  costs the difference rather than the sum. A broken kernel returns before the capture starts and
-  never takes a slot in the queue.
+- **Fired at test-pass, joined after the benchmark** — ncu, nsys and benchmark overlap. The profile
+  work is the long pole (hosted ncu is 245–270s alone, 515s observed behind a queue) and the
+  benchmark is ~172s, so overlapping costs the difference rather than the sum. A broken kernel
+  returns before the captures start and never takes a profiler slot.
 - **`--test-only` never profiles by default.** It is the ~10s call an agent makes most while
   iterating on correctness; a capture would make it ~25× slower and there is no timing to reason
-  about yet. `kernelthing score --profile` forces one; `--no-profile` suppresses it.
-- **It is evidence, not a verdict.** Every failure path in `profile_submission` returns a `Profile`
-  with `ok=False` and an `error`; none raise. The join is in a `finally`, so no exit path leaks the
+  about yet. `--no-profile` suppresses both profilers on a full score.
+- **It is evidence, not a verdict.** Every failure path returns a `Profile` / `NsysProfile` with
+  `ok=False` and an `error`; none raise. The join is in a `finally`, so no exit path leaks a
   thread. Losing a capture must never change whether a kernel scored.
 - **The digest, not the dump, is what the agent sees.** `profile_digest` cuts a 21KB `--set full`
   capture to ~12KB by keeping the launch header, four sections (Speed Of Light, Launch Statistics,
   Occupancy, Warp State) and *every* `OPT`/`INF`/`WRN` finding — the findings are what name a
   bottleneck. Unparseable input returns `""`; a profiler that changes format costs a digest, not a
   score.
+- **Nsight Systems is v1 Cholesky-only.** It parses `batch`, `n` and `seed` from
+  `benchmark_spec`, sends the submission source to `kernelthing/nsys_modal.py`, warms once on a
+  diagonal SPD tensor, and captures one CUDA-profiler-range call. Missing Modal auth, missing CLI,
+  unsupported leaderboards, malformed specs, timeouts and empty artifacts all become
+  `bench.nsys.ok=false`.
 - **`brev_defuse` hyphenates the evaluator's rejected substring** before any of this reaches an
   agent. Nsight prints it once per kernel header, and quoting a capture verbatim would hand the
   agent a string that silently poisons any file it lands in.
-- **The verdict JSON carries paths, never capture text** (`Profile.record`). The JSON line is the
-  seam; a 12KB digest crossing it would land in every `result.json` and every journal event on
-  every score. `score_command` prints the digest to stdout **above** the verdict instead, because
-  `_cli_score` finds the JSON by scanning stdout in reverse for the last line starting with `{`.
+- **The verdict JSON carries paths, never capture text** (`Profile.record` / `NsysProfile.record`). The JSON line is the
+  seam; a 12KB digest or nsys stats body crossing it would land in every `result.json` and every
+  journal event on every score. `score_command` prints the digest/stats to stdout **above** the
+  verdict instead, because `_cli_score` finds the JSON by scanning stdout in reverse for the last
+  line starting with `{`.
 
 `tests/fixtures/popcorn/ncu-details.txt` is a verbatim capture (index 2 of the cholesky board,
 recovered from member 10's `opencode.ndjson`). Re-capture rather than hand-edit, like the
@@ -322,8 +331,9 @@ recovered from member 10's `opencode.ndjson`). Re-capture rather than hand-edit,
 
 ### Reading the capture: `veloq`, and the version trap (`config.veloq_python`)
 
-The scorer writes `profile/latest/{ncu-details.txt,digest.txt,profile.ncu-rep}`. The text file is
-a rounded rendering; the report holds the same capture structured — per-launch metrics, the
+The scorer writes `profile/latest/{ncu-details.txt,digest.txt,profile.ncu-rep}` and
+`profile/latest/nsys/{profile.nsys-rep,profile.sqlite,stats.txt}`. The ncu text file is
+a rounded rendering; the ncu report holds the same capture structured — per-launch metrics, the
 profiler's rule findings with severities and `focus_metrics`, and per-source-line warp-stall
 histograms. `veloq ncu <verb>` reads it, **on this box, with no GPU** — it is a file parser.
 `prompts/claude/kernel-tools-veloq.md` teaches the verbs inline (measured on a real capture:

@@ -134,7 +134,7 @@ sandbox. Network stays up (the model API and the popcorn service need it); the
 filesystem is the confinement boundary. opencode's `--dangerously-skip-permissions`
 is only safe because of this.
 
-## Kernel tooling (KernelWiki + ncu profiling)
+## Kernel tooling (KernelWiki + profiling)
 
 Two vendored [KDA](https://github.com/mit-han-lab/kernel-design-agents) skills
 (git submodules under `vendor/`), injected into the agent's prompt:
@@ -142,9 +142,14 @@ Two vendored [KDA](https://github.com/mit-han-lab/kernel-design-agents) skills
 - **KernelWiki** (`vendor/KernelWiki`) — Blackwell/Hopper kernel-optimization
   knowledge base (read-only query).
 - **ncu-report-skill** (`vendor/ncu-report-skill`) — Nsight Compute profiling
-  workflow.
+  interpretation workflow.
 
 Disable with `--no-wiki` / `--no-ncu`.
+
+A full remote score automatically overlaps timing with two profiles of the scored shape:
+hosted Nsight Compute via popcorn, and a minimal Modal/B200 Nsight Systems timeline for
+Cholesky problems. Artifacts land under `profile/latest/` and `profile/latest/nsys/`.
+`kernelthing score --no-profile` skips both captures.
 
 ## GPU profiling permission (for ncu)
 
