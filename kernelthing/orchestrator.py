@@ -795,7 +795,7 @@ class Orchestrator:
             self.impl_session = res.session_id
         return res
 
-    def _cli_score(self, wt: Path) -> dict[str, Any]:
+    def _cli_score(self, wt: Path, *, no_profile: bool = False) -> dict[str, Any]:
         """Score a worktree by shelling out to ``kernelthing score`` and parsing its
         JSON. Runs the *same* code path agents use, and -- crucially -- in its own
         process, so concurrent scorings never race on the shared in-process import
@@ -805,9 +805,14 @@ class Orchestrator:
         plus ``stderr_tail`` when the scorer wrote to stderr. ``bench`` is the raw
         measurement record from the popcorn service (per-shape timings). Grading is
         remote, so no local GPU is involved.
+
+        ``no_profile`` suppresses both captures; only ``_evolve_seed`` passes it, for
+        the reason spelled out there.
         """
         prob_dir = wt / self.problem.rel_dir
         cmd = [sys.executable, "-m", "kernelthing", "score", str(prob_dir)]
+        if no_profile:
+            cmd.append("--no-profile")
         try:
             r = subprocess.run(
                 cmd, cwd=str(prob_dir), capture_output=True, text=True, timeout=1800
@@ -1014,6 +1019,23 @@ class Orchestrator:
         every operator falls back to explore (forking the base) until one works.
         Scoring shells out to ``kernelthing score`` (see ``_cli_score``), which
         submits the seed to the hosted popcorn service.
+
+        **The seed does not profile** (``no_profile=True``), and that is load-bearing
+        rather than a saving. The seed worktree is removed in the ``finally`` below
+        seconds after the score returns, so a capture taken here is deleted before
+        anything can read it -- ``members/0/result.json`` recorded ``profile.ok=True``
+        beside six artifact paths that all pointed at the deleted tree. Its one
+        lasting effect was harmful: profiles are cached on the submission's sha256,
+        and the first candidates score the *unmodified* seed file, so they hit that
+        entry. A hit returns the flat text only -- ``_profile_cache_load`` never
+        memoises the tens-of-MB report -- leaving an agent to read 190KB of
+        ``ncu-details.txt`` by eye on its first look at the problem, with every
+        ``veloq`` verb in its prompt and both analysis skills inapplicable. Skipping
+        the capture makes that first score a deliberate miss, so the candidate
+        profiles for real and gets a queryable report.
+
+        Test and benchmark are *not* skipped: those cache entries are pure win, and
+        the incumbent metric comes from them.
         """
         m = evolve.Member(id=pop.next_id(), operator="seed", commit=base, commit_message="baseline")
         wt = wt_root / "seed"
@@ -1032,7 +1054,9 @@ class Orchestrator:
                     m.score_detail = {"kernelguard": cheats}
                     return m
 
-            m.correct, m.metric, m.error, m.score_detail = self._score_tuple(self._cli_score(wt))
+            m.correct, m.metric, m.error, m.score_detail = self._score_tuple(
+                self._cli_score(wt, no_profile=True)
+            )
         finally:
             with self._git_lock:
                 gates.git(["worktree", "remove", "--force", str(wt)], self.wd)

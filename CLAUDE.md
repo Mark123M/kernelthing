@@ -332,6 +332,17 @@ a minimal Modal/B200 Nsight Systems timeline for Cholesky problems:
 - **`--test-only` never profiles by default.** It is the ~10s call an agent makes most while
   iterating on correctness; a capture would make it ~25× slower and there is no timing to reason
   about yet. `--no-profile` suppresses both profilers on a full score.
+- **Neither does the seed** (`_evolve_seed` passes `no_profile=True`), and that is the one place
+  where *not* capturing is the feature. `_evolve_seed` removes the seed worktree in its `finally`
+  seconds after the score returns, so a capture taken there is deleted before anything reads it —
+  `members/0/result.json` recorded `profile.ok=true` beside six artifact paths that all pointed at
+  the deleted tree. Its only lasting effect was harmful: captures are cached on the submission's
+  sha256, and the first candidates score the *unmodified* seed file, so they hit that entry. A hit
+  carries the flat text and no report (`_profile_cache_load` never memoises the tens-of-MB
+  `.ncu-rep`), so the agent gets 190KB of `ncu-details.txt` to read by eye on its first look at the
+  problem, with every `veloq` verb in its prompt and both analysis skills inapplicable. Skipping the
+  seed capture makes that first score a deliberate cache *miss*. Test and benchmark still cache —
+  those hits are pure win, and the incumbent metric comes from them.
 - **It is evidence, not a verdict.** Every failure path returns a `Profile` / `NsysProfile` with
   `ok=False` and an `error`; none raise. The join is in a `finally`, so no exit path leaks a
   thread. Losing a capture must never change whether a kernel scored.

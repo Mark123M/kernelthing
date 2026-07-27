@@ -589,7 +589,12 @@ def main(argv: list[str] | None = None) -> int:
     models = parser.add_argument_group("model")
     models.add_argument(
         "--model",
-        default="deepseek/deepseek-v4-pro",
+        # Take the default from Config rather than repeating it: run_loop passes
+        # args.model in unconditionally, so an argparse default that drifts from
+        # Config.model silently *becomes* the default and Config's is never used.
+        # It had drifted to the unprefixed slug, which opencode reads as a
+        # `deepseek` provider it has no credentials for -- see Config.model.
+        default=Config().model,
         help="opencode model that edits kernels and authors problems (default: %(default)s)",
     )
     models.add_argument(
