@@ -6,11 +6,11 @@ capture *structured*: per-launch metrics, the profiler's own rule findings with 
 and per-source-line warp-stall histograms. `veloq` reads it — no GPU involved, it is a file
 parser. Prefer it over grepping the text dump; fall back to the text only if `veloq` errors.
 
-The capture lands at the **worktree root**, not under `profile/`: `popcorn` extracts
-relative to its own cwd, so the report is `profile.<index>-<spec-slug>/profile.ncu-rep`.
+The scorer put it at `{{REPORT}}`, overwritten by each full score. A score whose capture
+came from cache has the text dump but no report; `veloq` will say so.
 
 ```bash
-REP=profile.*/profile.ncu-rep
+REP={{REPORT}}
 
 # 1. WHICH launch is yours? Only the first ~10 kernels are captured, and a plain
 #    PyTorch path fills them with copy/elementwise kernels. Always start here.

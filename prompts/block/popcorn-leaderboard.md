@@ -8,8 +8,8 @@ it and fill the board with dead ends. Deciding what gets ranked is not yours to 
 Everything you actually need to iterate is available:
 
 - `--test-only` on the scorer — correctness, one submission, fastest.
-- The scorer with no flags — correctness *and* the metric you are being ranked on
-  within this search.
-- `--profile-brev` — Nsight Compute counters from the competition hardware.
+- The scorer with no flags — correctness, the metric you are being ranked on within
+  this search, *and* an Nsight Compute profile of the scored shape, captured on the
+  competition hardware and printed above the verdict. You do not have to ask for it.
 
 Use those. The best kernel this search produces gets submitted for ranking afterwards.

@@ -100,9 +100,9 @@ class Config:
     # replay, shape hardcoding, ...). On by default; disqualifies cheaters.
     kernelguard: bool = True
     kernelguard_profile: str = "default"
-    # ncu: offer the agent the Nsight Compute knowledge/skill for reading the remote
-    # ``popcorn ... --profile-brev`` reports. Profiling itself is remote; nothing is
-    # bound in the sandbox for it.
+    # ncu: attach the vendored Nsight Compute *interpretation* skill pointer. Capturing
+    # the profile is not gated here at all -- every full ``kernelthing score`` takes one
+    # (``bench.popcorn.profile``), in a separate process that never sees this Config.
     ncu: bool = True
     wiki: bool = True
     # veloq: read the downloaded .ncu-rep as structured JSON instead of grepping the

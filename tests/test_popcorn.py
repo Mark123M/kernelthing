@@ -22,6 +22,8 @@ No network: ``popcorn.submit`` is faked wherever a score is exercised.
 from __future__ import annotations
 
 import json
+import re
+import threading
 from pathlib import Path
 
 import pytest
@@ -77,6 +79,11 @@ def _problem(tmp_path, **popcorn_cfg) -> Problem:
         "submission_file": "submission.py",
         "benchmark_index": TARGET_INDEX,
         "benchmark_spec": TARGET_SPEC,
+        # Off by default here, on by default in production. `score` shells out to the
+        # real popcorn CLI to profile, and the CLI is installed on a dev box -- leaving
+        # this on would have every scoring test queue a live job on gpu-mode's hosted
+        # profiler. The tests that do exercise profiling stub `profile_submission`.
+        "profile": False,
     }
     cfg.update(popcorn_cfg)
     (tmp_path / "submission.py").write_text("def custom_kernel(data):\n    return data\n")
@@ -698,3 +705,204 @@ def test_score_command_exit_code_is_nonzero_when_incorrect(tmp_path, monkeypatch
     verdict = json.loads(capsys.readouterr().out.strip().splitlines()[0])
     assert rc == 1
     assert verdict["correct"] is False and verdict["metric"] is None
+
+
+# --- automatic profiling ----------------------------------------------------
+#
+# `ncu-details.txt` is a verbatim capture too: benchmark index 2 of the cholesky board,
+# read back out of member 10's `opencode.ndjson` in the 2026-07-24 run. Re-capture rather
+# than hand-edit, same as the `--output` fixtures above.
+
+NCU_DETAILS = _fixture("ncu-details")
+
+
+def _fake_profile(monkeypatch, prof: popcorn.Profile, seen: list | None = None, gate=None):
+    """Replace the hosted profiler with a canned result.
+
+    ``gate`` is set the moment the profile starts, so a test can prove the capture is
+    already running while the timing submission is still in flight.
+    """
+
+    def fake(cfg, sub_path, dest, digest):
+        if seen is not None:
+            seen.append(digest)
+        if gate is not None:
+            gate.set()
+        return prof
+
+    monkeypatch.setattr(popcorn, "profile_submission", fake)
+
+
+def _ok_profile(digest: str = "OPT   grid too small") -> popcorn.Profile:
+    return popcorn.Profile(
+        ok=True,
+        details_path="/wt/profile/latest/ncu-details.txt",
+        digest_path="/wt/profile/latest/digest.txt",
+        digest=digest,
+        wall_s=251.0,
+    )
+
+
+def test_digest_keeps_every_rule_finding_and_drops_the_bulk():
+    """The findings name the bottleneck; the other ten sections are context nobody asked
+    for, re-quoted on every score."""
+    cfg = popcorn.PopcornConfig(leaderboard="cholesky")
+    digest = popcorn.profile_digest(NCU_DETAILS, cfg)
+    # every OPT/INF/WRN survives
+    rules = len([ln for ln in NCU_DETAILS.splitlines() if popcorn.PROFILE_RULE_RE.match(ln)])
+    assert rules == 16
+    assert len([ln for ln in digest.splitlines() if popcorn.PROFILE_RULE_RE.match(ln)]) == rules
+    # the launch header and its kernel signature (the only place the shape appears)
+    assert "blocked_128_kernel" in digest and "(256, 1, 1)x(128, 1, 1)" in digest
+    # kept sections, with their numbers
+    assert "Compute (SM) Throughput" in digest and "16.47" in digest
+    assert "Achieved Occupancy" in digest and "Registers Per Thread" in digest
+    # dropped sections
+    for gone in ("Section: PM Sampling", "Section: Instruction Statistics",
+                 "Section: Memory Workload Analysis Tables"):
+        assert gone not in digest
+    assert len(digest) < len(NCU_DETAILS)
+
+
+def test_digest_defuses_the_token_the_evaluator_rejects():
+    """Nsight prints it in every kernel header. Quoting a capture into an agent's context
+    verbatim hands it a string that silently poisons any file it is pasted into."""
+    cfg = popcorn.PopcornConfig(leaderboard="cholesky", reject_substrings=["stream"])
+    assert len(re.findall("stream", NCU_DETAILS, re.I)) == 1
+    digest = popcorn.profile_digest(NCU_DETAILS, cfg)
+    assert not re.search("stream", digest, re.I)
+    assert "s-t-r-e-a-m" in digest
+
+
+def test_digest_survives_output_it_cannot_parse():
+    """A profiler that changes its format must cost a digest, not a score."""
+    cfg = popcorn.PopcornConfig(leaderboard="cholesky")
+    assert popcorn.profile_digest("", cfg) == ""
+    assert popcorn.profile_digest("total gibberish\nno sections here\n", cfg) == ""
+
+
+def test_profile_runs_concurrently_with_the_timing_submission(tmp_path, monkeypatch):
+    """The whole point of firing at test-pass rather than after the score: the profile is
+    the long pole (245s+) and the benchmark is ~172s, so they have to overlap."""
+    started = threading.Event()
+
+    def fake_submit(cfg, sub_path, mode, digest):
+        if mode == "benchmark":
+            # Serial ordering would deadlock here: the profile is only started after the
+            # test submission returns, so if it waited on the benchmark this never fires.
+            assert started.wait(timeout=10), "benchmark ran without the profile in flight"
+        return popcorn.Submission(
+            mode=mode, text={"test": TEST_OK, "benchmark": BENCHMARK_OK}[mode],
+            returncode=0, wall_s=1.0,
+        )
+
+    monkeypatch.setattr(popcorn, "submit", fake_submit)
+    _fake_profile(monkeypatch, _ok_profile(), gate=started)
+    correct, metric, err, detail = popcorn.score(_problem(tmp_path, profile=True), tmp_path)
+    assert (correct, err) == (True, None)
+    assert metric == pytest.approx(75.1)
+    assert detail["profile"]["ok"] is True
+
+
+def test_a_broken_kernel_never_reaches_the_profiler_queue(tmp_path, monkeypatch):
+    """A failed test returns before the capture starts -- the profiler is a single-worker
+    queue, and a kernel that does not run has nothing worth measuring anyway."""
+    seen: list[str] = []
+    _fake_submit(monkeypatch, {"test": TEST_FAIL})
+    _fake_profile(monkeypatch, _ok_profile(), seen=seen)
+    correct, _metric, err, detail = popcorn.score(_problem(tmp_path, profile=True), tmp_path)
+    assert correct is False and err
+    assert seen == [] and "profile" not in detail
+
+
+def test_test_only_stays_cheap_by_default(tmp_path, monkeypatch):
+    """--test-only is the ~10s correctness call an agent makes most; a capture would make
+    it ~25x slower and produces no timing to reason about. Explicit --profile overrides."""
+    seen: list[str] = []
+    _fake_submit(monkeypatch, {"test": TEST_OK})
+    _fake_profile(monkeypatch, _ok_profile(), seen=seen)
+    prob = _problem(tmp_path, profile=True)
+
+    correct, _m, err, detail = popcorn.score(prob, tmp_path, test_only=True)
+    assert (correct, err) == (True, None)
+    assert seen == [] and "profile" not in detail
+
+    correct, _m, err, detail = popcorn.score(prob, tmp_path, test_only=True, profile=True)
+    assert (correct, err) == (True, None)
+    assert len(seen) == 1 and detail["profile"]["ok"] is True
+
+
+def test_a_failed_profile_never_changes_the_verdict(tmp_path, monkeypatch):
+    """Evidence, not a verdict. Every failure path records itself and returns."""
+    _fake_submit(monkeypatch, {"test": TEST_OK, "benchmark": BENCHMARK_OK})
+    _fake_profile(monkeypatch, popcorn.Profile(ok=False, error="profile timed out after 1200s"))
+    correct, metric, err, detail = popcorn.score(_problem(tmp_path, profile=True), tmp_path)
+    assert (correct, err) == (True, None)
+    assert metric == pytest.approx(75.1)
+    assert detail["profile"] == {"ok": False, "wall_s": 0.0, "error": "profile timed out after 1200s"}
+
+
+def test_the_verdict_carries_paths_not_capture_text(tmp_path, monkeypatch):
+    """The JSON line is the seam. A 12KB digest crossing it would land in every
+    result.json and every journal event, on every score, for no reader."""
+    _fake_submit(monkeypatch, {"test": TEST_OK, "benchmark": BENCHMARK_OK})
+    _fake_profile(monkeypatch, _ok_profile(digest="OPT   this must not appear in the JSON"))
+    _c, _m, _e, detail = popcorn.score(_problem(tmp_path, profile=True), tmp_path)
+    assert "this must not appear" not in json.dumps(detail)
+    assert detail["profile"]["digest_path"].endswith("digest.txt")
+
+
+def test_score_command_prints_the_profile_above_the_verdict(tmp_path, monkeypatch, capsys):
+    """_cli_score finds the verdict by scanning stdout in reverse for the last line
+    starting with '{'. Printing the capture first makes that impossible to break."""
+    digest_file = tmp_path / "digest.txt"
+    digest_file.write_text("OPT   {this line starts with a brace}\n", encoding="utf-8")
+    _fake_submit(monkeypatch, {"test": TEST_OK, "benchmark": BENCHMARK_OK})
+    prof = _ok_profile()
+    prof.digest_path = str(digest_file)
+    _fake_profile(monkeypatch, prof)
+
+    class Args:
+        test_only = False
+        emit_baseline = False
+        profile = True
+
+    rc = popcorn.score_command(_problem(tmp_path), Args())
+    out = capsys.readouterr().out
+    assert rc == 0
+    verdict = json.loads(out.strip().splitlines()[-1])
+    assert verdict["correct"] is True and verdict["metric"] == pytest.approx(TARGET_US)
+    assert "Nsight Compute profile" in out
+    assert "{this line starts with a brace}" in out
+    assert out.index("Nsight Compute profile") < out.index('"correct"')
+
+
+def test_score_command_says_so_when_the_capture_failed(tmp_path, monkeypatch, capsys):
+    _fake_submit(monkeypatch, {"test": TEST_OK, "benchmark": BENCHMARK_OK})
+    _fake_profile(monkeypatch, popcorn.Profile(ok=False, error="popcorn CLI not found"))
+
+    class Args:
+        test_only = False
+        emit_baseline = False
+        profile = True
+
+    assert popcorn.score_command(_problem(tmp_path), Args()) == 0
+    out = capsys.readouterr().out
+    assert "profile unavailable: popcorn CLI not found" in out
+    assert json.loads(out.strip().splitlines()[-1])["correct"] is True
+
+
+def test_an_exploding_profile_thread_never_fails_the_score(tmp_path, monkeypatch):
+    """The join happens inside `finally`, so an escaped exception there would replace an
+    already-computed verdict with a traceback."""
+    _fake_submit(monkeypatch, {"test": TEST_OK, "benchmark": BENCHMARK_OK})
+
+    def boom(cfg, sub_path, dest, digest):
+        raise ZeroDivisionError("unexpected")
+
+    monkeypatch.setattr(popcorn, "profile_submission", boom)
+    correct, metric, err, detail = popcorn.score(_problem(tmp_path, profile=True), tmp_path)
+    assert (correct, err) == (True, None)
+    assert metric == pytest.approx(75.1)
+    assert detail["profile"]["ok"] is False
+    assert "ZeroDivisionError" in detail["profile"]["error"]

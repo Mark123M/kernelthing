@@ -17,6 +17,12 @@ Scoring is two remote submissions, in order:
   1. ``popcorn submit --mode test``      -- correctness over the public test shapes.
   2. ``popcorn submit --mode benchmark`` -- timings; only reached if (1) passed.
 
+...plus a third, ``--profile-brev``, fired *concurrently with* (2) the moment (1) passes.
+See ``profile_submission``: it is a different service on a different endpoint, so it
+cannot be folded into a submission, but it can overlap one. Overlapping is the whole
+trick -- the profile is the long pole (245-270s alone, more behind the queue) and the
+benchmark is ~172s, so running them together costs the difference rather than the sum.
+
 Splitting them is what makes a broken kernel cheap: ``test`` runs small shapes and
 returns fast, so most failures never pay for a benchmark. ``benchmark`` re-checks every
 shape anyway (``run_benchmarking`` passes ``recheck=True``), so a kernel that only breaks
@@ -64,6 +70,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -98,11 +105,44 @@ CLI_ID_HEADER = "X-Popcorn-Cli-Id"
 SOURCE_API = "api"
 SOURCE_TEXT = "cli-text"
 
-# Submission modes we drive. "profile" is the agent's business (--profile-brev), not the
-# scorer's.
+# Submission modes we drive.
 MODE_TEST = "test"
 MODE_BENCHMARK = "benchmark"
 MODE_LEADERBOARD = "leaderboard"
+# Not a submission mode: --profile-brev is its own service (see profile_submission).
+MODE_PROFILE = "profile"
+
+# The profile runs concurrently with the timing submission, so this cap does not add to
+# the budget -- the pair costs max(timeout_s, PROFILE_TIMEOUT_S), and holding them equal
+# keeps the total at the same 300 + 1200 that already fits _cli_score's 1800s kill.
+#
+# Sized off the 2026-07-24 run: a job is 245-270s with an empty queue and grows with
+# depth (515s observed at depth 2). The service itself never killed a job in that run;
+# all four losses were the *client* giving up early, and it gives up after paying the
+# full wait, because the CLI downloads artifacts only once the job reports `succeeded`.
+PROFILE_TIMEOUT_S = 1200
+
+# Where the capture lands inside the worktree. Every problem's .gitignore already covers
+# `profile/` (test_harness_deps asserts it), so the artifacts cannot reach a commit. It
+# cannot live in the submission cache instead: the sandbox ro-binds everything except the
+# worktree, so an agent's own `kernelthing score` could not write there.
+PROFILE_DIR = "profile"
+PROFILE_SUBDIR = "latest"
+
+# ncu-details.txt sections worth quoting back in full. The rule findings (OPT/INF/WRN)
+# are always kept and are what actually names a bottleneck; these three carry the numbers
+# an agent needs to check one. The rest of a --set full dump (roofline, PM sampling,
+# instruction mix, memory tables) is ~14 sections of context for a question nobody asked.
+PROFILE_KEEP_SECTIONS = (
+    "GPU Speed Of Light Throughput",
+    "Launch Statistics",
+    "Occupancy",
+    "Warp State Statistics",
+)
+# `[73] python3.12@127.0.0.1` opens a launch; the kernel signature is the line after it.
+PROFILE_LAUNCH_RE = re.compile(r"^\[\d+\]\s")
+PROFILE_SECTION_RE = re.compile(r"^\s{4}Section:\s*(?P<name>.+?)\s*$")
+PROFILE_RULE_RE = re.compile(r"^\s{4}(?:OPT|INF|WRN)\s")
 
 # How the parsed per-shape timings become a single number.
 #   shape       -- one benchmark index's mean (the default; a per-shape specialisation
@@ -169,6 +209,10 @@ class PopcornConfig:
     reject_substrings: list[str] = field(default_factory=list)
     cache: bool = True
     bin: str = ""
+    # Capture an Nsight Compute profile alongside every full score. On by default: the
+    # point is that an agent never has to decide to profile, so it never reasons about a
+    # bottleneck it did not measure.
+    profile: bool = True
 
     @property
     def timing_mode(self) -> str:
@@ -269,6 +313,7 @@ def resolve_config(problem: Problem) -> PopcornConfig:
         reject_substrings=[str(s) for s in raw.get("reject_substrings", [])],
         cache=bool(raw.get("cache", True)),
         bin=str(raw.get("bin", "")),
+        profile=bool(raw.get("profile", True)),
     )
 
 
@@ -764,6 +809,267 @@ def _attach_raw(sub: Submission) -> None:
 # --- scoring ----------------------------------------------------------------
 
 
+# --- profiling --------------------------------------------------------------
+
+
+@dataclass
+class Profile:
+    """One hosted Nsight Compute capture, as far as the scorer is concerned."""
+
+    ok: bool = False
+    details_path: str = ""  # ncu-details.txt, the flat --set full dump
+    report_path: str = ""  # profile.ncu-rep, for veloq; absent on a cache hit
+    digest_path: str = ""  # digest.txt, what score_command echoes to the agent
+    digest: str = ""  # the same text, in memory
+    wall_s: float = 0.0
+    cached: bool = False
+    error: str = ""
+
+    def record(self) -> dict[str, Any]:
+        """The verdict's ``bench.profile`` entry: status and *paths*, never capture text.
+
+        The JSON line is the seam between this module and everything downstream, so the
+        capture must not cross it -- the orchestrator, the journal and the web UI would
+        each grow a copy of a dump they have no use for, on every score. The agent gets
+        the digest on stdout instead (see ``score_command``), and anything that wants the
+        rest opens ``details_path``.
+        """
+        d: dict[str, Any] = {"ok": self.ok, "wall_s": round(self.wall_s, 1)}
+        if self.cached:
+            d["cached"] = True
+        for key in ("details_path", "report_path", "digest_path"):
+            if getattr(self, key):
+                d[key] = getattr(self, key)
+        if self.error:
+            d["error"] = self.error[:500]
+        return d
+
+
+def brev_defuse(text: str, cfg: PopcornConfig) -> str:
+    """Break any evaluator-rejected substring in profiler output before an agent sees it.
+
+    Nsight prints a kernel header as ``..., Context 1, S-t-r-e-a-m 7, Device 0, ...``
+    (hyphenated here so this source file does not carry the token either). The evaluator
+    rejects a submission containing that substring *anywhere* -- inside a longer word,
+    inside a comment -- so quoting a capture verbatim into an agent's context hands it a
+    string that silently poisons any file it lands in. Hyphenating costs nothing to read
+    and cannot be pasted into a rejection.
+    """
+    for bad in cfg.reject_substrings:
+        if len(bad) < 2:
+            continue
+        text = re.sub(re.escape(bad), "-".join(bad), text, flags=re.IGNORECASE)
+    return text
+
+
+def profile_digest(details: str, cfg: PopcornConfig) -> str:
+    """Reduce a ``--set full`` dump to the part that names a bottleneck.
+
+    A real capture is ~21KB over 14 sections per launch. Almost all of the signal is in
+    the profiler's own OPT/INF/WRN rule findings (16 of them in that capture) plus the
+    handful of tables you would check them against; the rest is a wall of numbers that
+    would be re-quoted on every score. Keeps launch headers, ``PROFILE_KEEP_SECTIONS``,
+    and every rule finding with its continuation lines.
+
+    Unrecognised input degrades to '' rather than raising -- a profiler that changes its
+    output format must cost the run a digest, not a score.
+    """
+    keep: list[str] = []
+    section = ""
+    in_rule = False
+    want_signature = False
+    for raw_line in details.splitlines():
+        line = raw_line.rstrip()
+        if PROFILE_LAUNCH_RE.match(line):
+            section, in_rule, want_signature = "", False, True
+            keep += ["", line]
+            continue
+        if want_signature:
+            # The mangled kernel name plus `(grid)x(block), Context, Stream, ..., CC`.
+            # It is the only place the launch's shape appears, and the only place the
+            # evaluator's rejected token appears -- brev_defuse handles that below.
+            if line.strip():
+                keep.append(line)
+                want_signature = False
+            continue
+        m = PROFILE_SECTION_RE.match(line)
+        if m:
+            section, in_rule = m.group("name"), False
+            if section in PROFILE_KEEP_SECTIONS:
+                keep += ["", line]
+            continue
+        if PROFILE_RULE_RE.match(line):
+            in_rule = True
+            keep.append(line)
+            continue
+        # A rule's wrapped continuation is indented past its 4-space marker; a blank line
+        # ends it. Section tables sit at exactly 4, so they cannot be mistaken for one.
+        if in_rule:
+            if line.strip() and line.startswith("     "):
+                keep.append(line)
+                continue
+            in_rule = False
+        if section in PROFILE_KEEP_SECTIONS and line.strip():
+            keep.append(line)
+    text = "\n".join(keep).strip()
+    return brev_defuse(text, cfg) if text else ""
+
+
+def _profile_cache_path(cfg: PopcornConfig, digest: str) -> Path:
+    return _cache_root() / cfg.leaderboard / cfg.gpu / MODE_PROFILE / f"{digest}.txt"
+
+
+def _profile_cache_load(cfg: PopcornConfig, digest: str) -> str:
+    """The cached ``ncu-details.txt`` for this exact submission, or ''.
+
+    Only the flat text is memoised, not the ``.ncu-rep`` -- the report is tens of MB and
+    a cache of them would outgrow its own directory within a run. So a cache hit gives
+    back the digest and the details file but no report for veloq to open; ``Profile.cached``
+    records that, and re-profiling is one `--no-cache` away.
+    """
+    if not cfg.cache:
+        return ""
+    try:
+        return _profile_cache_path(cfg, digest).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _profile_cache_store(cfg: PopcornConfig, digest: str, details: str) -> None:
+    if not cfg.cache or not details.strip():
+        return
+    path = _profile_cache_path(cfg, digest)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".txt.tmp")
+        tmp.write_text(details, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        # Expected inside the sandbox: bwrap ro-binds everything but the worktree, so an
+        # agent's own score cannot populate this. Reads still work; a miss just profiles.
+        pass
+
+
+def _find_capture(root: Path) -> Path | None:
+    """The ``profile.<index>-<spec-slug>/`` directory the CLI extracted, if any."""
+    for child in sorted(root.glob("profile.*")):
+        if child.is_dir() and (child / "ncu-details.txt").is_file():
+            return child
+    return None
+
+
+def profile_submission(cfg: PopcornConfig, sub_path: Path, dest: Path, digest: str) -> Profile:
+    """Capture one hosted Nsight Compute profile of ``benchmark_index``.
+
+    Best-effort by construction: every failure path returns a ``Profile`` with ``ok``
+    false and an ``error``, and none of them raise. A profile is evidence, not a verdict
+    -- losing one must never change whether a kernel scored.
+
+    ``--profile-brev`` is a *different service* from the one ``submit`` talks to: it POSTs
+    to ``$POPCORN_BREV_PROFILER_URL/profile``, gets a job id, polls it, and downloads a
+    zip. There is no submission id and nothing in the popcorn API to correlate it with,
+    which is why this cannot be another ``mode`` of ``submit``.
+
+    The CLI extracts **relative to its own cwd**, ignoring ``--output`` -- so it runs in a
+    temp dir and the capture is moved to ``dest`` afterwards. Doing that here is what
+    removes the whole class of bug the agents used to hit by hand: no stray ``profile.*/``
+    at the worktree root, no ``workdir`` that must exist before the command that creates it.
+    """
+    prof = Profile()
+    cached = _profile_cache_load(cfg, digest)
+    if cached:
+        prof.cached = True
+        _land(prof, dest, cached, cfg)
+        if not prof.ok:
+            prof.error = f"could not write cached capture under {dest}"
+        return prof
+
+    exe = popcorn_bin(cfg)
+    if not exe:
+        prof.error = "popcorn CLI not found on PATH (set bench.popcorn.bin)"
+        return prof
+
+    # Printed only past the cache check, and only once the run is really going to cost
+    # minutes: the CLI's own poll chatter is captured below, so without this the caller
+    # stares at a silent five minutes and cannot tell a queued profile from a hung score.
+    print(
+        f"profiling benchmark index {cfg.benchmark_index} on the hosted Nsight service "
+        "(minutes; runs alongside the timing submission)...",
+        file=sys.stderr,
+    )
+    env = dict(os.environ)
+    env.setdefault("POPCORN_BREV_PROFILER_URL", brev_profiler_url())
+    t0 = time.time()
+    with tempfile.TemporaryDirectory(prefix="kt-profile-") as tmp:
+        cmd = [
+            exe, "submit", str(sub_path.resolve()),
+            "--leaderboard", cfg.leaderboard,
+            "--profile-brev",
+            "--benchmark-index", str(cfg.benchmark_index),
+            "--no-tui",
+            "--output", "brev.json",
+        ]
+        try:
+            r = subprocess.run(
+                cmd, cwd=tmp, capture_output=True, text=True,
+                timeout=PROFILE_TIMEOUT_S, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            prof.wall_s = time.time() - t0
+            prof.error = f"profile timed out after {PROFILE_TIMEOUT_S}s"
+            return prof
+        except OSError as e:
+            prof.wall_s = time.time() - t0
+            prof.error = f"profile could not start: {e}"
+            return prof
+        prof.wall_s = time.time() - t0
+        capture = _find_capture(Path(tmp))
+        if capture is None:
+            tail = ((r.stderr or "") + (r.stdout or "")).strip()[-500:]
+            prof.error = f"profile produced no capture (exit {r.returncode}): {tail}"
+            return prof
+        details = ""
+        with contextlib.suppress(OSError):
+            details = (capture / "ncu-details.txt").read_text(encoding="utf-8", errors="replace")
+        _land(prof, dest, details, cfg)
+        report = capture / "profile.ncu-rep"
+        if prof.ok and report.is_file():
+            with contextlib.suppress(OSError):
+                shutil.copy2(report, dest / report.name)
+                prof.report_path = str(dest / report.name)
+
+    if not prof.ok:
+        prof.error = prof.error or f"could not write capture under {dest}"
+    else:
+        _profile_cache_store(cfg, digest, details)
+    return prof
+
+
+def _land(prof: Profile, dest: Path, details: str, cfg: PopcornConfig) -> None:
+    """Write the capture and its digest into ``dest`` and fill in ``prof``.
+
+    ``digest.txt`` is written beside the full dump rather than returned in memory so the
+    text has exactly one home: ``score_command`` echoes it to the agent, the orchestrator
+    can read it off a finished member, and the verdict JSON carries only its path.
+    """
+    if not details.strip():
+        return
+    prof.digest = profile_digest(details, cfg)
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        details_path = dest / "ncu-details.txt"
+        details_path.write_text(details, encoding="utf-8")
+        prof.details_path = str(details_path)
+        prof.ok = True
+    except OSError:
+        return
+    if prof.digest:
+        with contextlib.suppress(OSError):
+            digest_path = dest / "digest.txt"
+            digest_path.write_text(prof.digest + "\n", encoding="utf-8")
+            prof.digest_path = str(digest_path)
+
+
 def _precheck(cfg: PopcornConfig, source: str) -> str | None:
     """Local rejections that would otherwise cost a remote round-trip."""
     try:
@@ -860,13 +1166,32 @@ def _metric_from(
 
 
 def score(
-    problem: Problem, worktree: Path, *, test_only: bool = False
+    problem: Problem,
+    worktree: Path,
+    *,
+    test_only: bool = False,
+    profile: bool | None = None,
 ) -> tuple[bool, float | None, str | None, dict[str, Any]]:
     """Score a worktree through the hosted popcorn service.
 
     Returns ``(correct, metric, err, detail)`` -- the same tuple ``bench.score`` returns,
     so ``cli.score_command`` can emit an identical verdict either way. ``metric`` is in
     microseconds and lower is better, so a popcorn problem sets ``direction: minimize``.
+
+    ``profile`` overrides ``bench.popcorn.profile`` (``None`` defers to it, and is what
+    the CLI passes unless ``--no-profile`` was given). When on, a hosted Nsight Compute
+    capture is started as soon as the test submission passes and joined after the timing
+    submission returns, so the two overlap; the capture lands in
+    ``<worktree>/profile/latest/`` and its paths land in ``detail["profile"]``.
+
+    Starting it at test-pass rather than at entry is the one place this is *not* maximally
+    concurrent, and deliberately: overlapping the test as well would buy ~10s, while a
+    kernel that fails correctness would already have taken a ~300s slot in a queue that
+    runs one job at a time.
+
+    A profile is never allowed to affect the verdict. It is fired only after correctness
+    is established, its failures are recorded rather than raised, and it is joined in a
+    ``finally`` so an exception on the timing path cannot leak the thread.
     """
     try:
         cfg = resolve_config(problem)
@@ -906,6 +1231,24 @@ def score(
             ids[mode] = sid
         return sub
 
+    # Default: capture on a full score, never on --test-only. There is nothing to overlap
+    # a profile with on the test path -- it is a ~10s call, so a capture would make it
+    # ~25x slower -- and nothing to reason about either, since --test-only produces no
+    # timing. That is the call an agent iterating on correctness makes most often, and
+    # keeping it cheap is what stops it from being avoided.
+    want_profile = (cfg.profile and not test_only) if profile is None else profile
+    pool: ThreadPoolExecutor | None = None
+    pending: Any = None  # Future[Profile], typed loosely to keep the import surface small
+
+    def start_profile() -> None:
+        """Kick off the capture in the background. Called once correctness is known."""
+        nonlocal pool, pending
+        if not want_profile or pending is not None:
+            return
+        dest = Path(worktree) / problem.rel_dir / PROFILE_DIR / PROFILE_SUBDIR
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kt-profile")
+        pending = pool.submit(profile_submission, cfg, sub_path, dest, digest)
+
     try:
         test_sub = run(MODE_TEST)
         report = (
@@ -926,6 +1269,13 @@ def score(
                 {"wall_s": wall, "submission_ids": ids, "cached": cached, "source": sources}
             )
             return False, None, _test_error(report, total), detail
+
+        # Correctness is established, so the kernel is worth measuring. Start the capture
+        # *here*, before the timing submission, so the two run together: the profile is
+        # the long pole (245s+) and the benchmark is ~172s, so overlapping them costs the
+        # difference instead of the sum. A broken kernel never reaches this line and so
+        # never spends a slot in the profiler's queue.
+        start_profile()
         if test_only:
             detail.update(
                 {"wall_s": wall, "submission_ids": ids, "cached": cached, "source": sources}
@@ -959,6 +1309,60 @@ def score(
             {"wall_s": wall, "submission_ids": ids, "cached": cached, "source": sources}
         )
         return False, None, str(e), detail
+    finally:
+        # Joined here rather than at any single return so that every exit -- pass, shape
+        # re-check failure, PopcornError -- reclaims the thread and reports what the
+        # capture did. ``detail`` is returned by reference, so mutating it after the
+        # return expression has been evaluated still reaches the caller.
+        if pending is not None:
+            try:
+                prof: Profile = pending.result()
+            except Exception as e:  # a capture must never fail a score
+                # profile_submission handles its own expected failures; this catches the
+                # unexpected ones. Raising here would happen *inside* finally, replacing
+                # an already-computed verdict with a traceback -- the one way a profile
+                # could still change whether a kernel scored.
+                prof = Profile(error=f"{type(e).__name__}: {e}"[:500])
+            detail["profile"] = prof.record()
+        if pool is not None:
+            pool.shutdown(wait=True)
+
+
+def format_profile_block(detail: dict[str, Any]) -> str:
+    """The profile section ``score_command`` prints above the verdict, or ''.
+
+    This is the whole point of capturing automatically: the numbers arrive in the same
+    tool output as the score, so an agent cannot reason about a bottleneck without having
+    measured one. It leads with the profiler's own findings and says where the rest is.
+    """
+    prof = detail.get("profile")
+    if not isinstance(prof, dict):
+        return ""
+    if not prof.get("ok"):
+        reason = str(prof.get("error") or "unknown")
+        return f"--- Nsight Compute profile unavailable: {reason} ---"
+    digest_path = str(prof.get("digest_path") or "")
+    body = ""
+    if digest_path:
+        with contextlib.suppress(OSError):
+            body = Path(digest_path).read_text(encoding="utf-8").strip()
+    lines = [
+        "--- Nsight Compute profile of the scored shape "
+        + ("(cached: identical submission) " if prof.get("cached") else "")
+        + "---",
+        "Instrumented durations run ~2x the benchmark time; read this for ratios and",
+        "bottlenecks, never as a timing. The evaluator's rejected token is hyphenated",
+        "below, so nothing here is safe to paste into the submission either way.",
+        "",
+        body,
+        "",
+    ]
+    if prof.get("details_path"):
+        lines.append(f"Full --set full dump: {prof['details_path']}")
+    if prof.get("report_path"):
+        lines.append(f"Structured capture (veloq ncu ...): {prof['report_path']}")
+    lines.append("--- end profile ---")
+    return "\n".join(lines)
 
 
 def score_command(problem: Problem, args: Any) -> int:
@@ -968,10 +1372,21 @@ def score_command(problem: Problem, args: Any) -> int:
     only when the submission is correct. ``--emit-baseline`` / ``--baseline-median`` are
     accepted and ignored: the metric is an absolute time, so there is no denominator to
     pin, and the orchestrator's seed path already tolerates a missing baseline.
+
+    The profile block is printed **before** the verdict on purpose: ``_cli_score`` finds
+    the JSON by scanning stdout in reverse for the last line starting with ``{``, so
+    anything emitted after it would have to be guaranteed brace-free forever. Printing
+    first makes that impossible to get wrong.
     """
     correct, metric, err, detail = score(
-        problem, problem.repo_root, test_only=bool(getattr(args, "test_only", False))
+        problem,
+        problem.repo_root,
+        test_only=bool(getattr(args, "test_only", False)),
+        profile=getattr(args, "profile", None),
     )
+    block = format_profile_block(detail)
+    if block:
+        print(block)
     result: dict[str, Any] = {
         "unit": problem.unit,
         "correct": correct,

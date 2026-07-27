@@ -46,6 +46,20 @@ CUDA_DOCS_MCP_INSTRUCTIONS = (
     "in current, authoritative documentation."
 )
 
+# opencode's bash tool defaults to a 120s cap and lets the model raise it per call, up to
+# its own MAX_TIMEOUT_MS of 600000 (both read out of the shipped binary). Leaving the
+# choice to the model is what loses profiles: in the 2026-07-24 run the model picked
+# 360000 on 8 of 23 `--profile-brev` calls and *every one of the run's 4 kills* was one of
+# those, while all 15 calls at 420000 or above completed. The service never killed a job.
+# A hosted profile is 245-270s alone and grows with the queue (515s observed at depth 2),
+# so the default has to clear ~600s or the loop pays full price for an artifact it then
+# throws away -- the brev job keeps running server-side, but the CLI dies before the
+# post-`succeeded` artifact download.
+#
+# setdefault, like VELOQ_PYTHON: an operator's export wins.
+BASH_TIMEOUT_ENV = "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS"
+BASH_TIMEOUT_MS = 600_000
+
 
 def opencode_state_dirs() -> list[Path]:
     """opencode's own writable state dirs (kept writable inside the sandbox)."""
@@ -204,6 +218,9 @@ def build_opencode_env(
     veloq_py = veloq_python()
     if veloq_py:
         env.setdefault("VELOQ_PYTHON", veloq_py)
+
+    # Raise the bash tool's default cap so a remote profile is not cut off mid-poll.
+    env.setdefault(BASH_TIMEOUT_ENV, str(BASH_TIMEOUT_MS))
 
     oc_config: dict[str, Any] = {"snapshot": False}
     if mcp_cuda_docs:

@@ -198,6 +198,17 @@ def score_command(argv: list[str]) -> int:
         help="check correctness only, skipping the timing run: the cheap pre-check "
         "(one popcorn submission instead of two). Prints no metric.",
     )
+    # Unset defers to bench.popcorn.profile, which captures on a full score and not on
+    # --test-only. There is deliberately no --profile to go with this: profiling is not
+    # a choice the caller makes any more, so the only flag worth having is the escape
+    # hatch for when the profiler's queue is what you are waiting on.
+    p.add_argument(
+        "--no-profile",
+        dest="profile",
+        action="store_false",
+        default=None,
+        help="skip the Nsight Compute capture this score would otherwise take",
+    )
     args = p.parse_args(argv)
 
     try:

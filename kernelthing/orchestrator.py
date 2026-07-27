@@ -429,48 +429,48 @@ class Orchestrator:
                     WIKI_DIR=str(wiki_dir),
                 )
             )
-        if self.cfg.ncu:
-            # The skill is a git submodule and is routinely uninitialised; pointing an
-            # agent at a SKILL.md that is not there just burns a turn. The profiling
-            # workflow itself does not depend on it, so only the pointer is dropped.
-            #
-            # SKILL.md's links are all relative and its workflow assumes a local GPU
-            # (build a .cu harness, run ncu, parse with ncu_report) -- neither is true
-            # here, so the pointer has to say so or the agent follows it off a cliff.
-            skill_note = ""
-            if _vendored(ncu_dir):
-                nsight = _ncu_report_pythonpath()
-                helper_note = (
-                    f"Its `helpers/*.py` need `PYTHONPATH={nsight}` "
-                    "(`ncu_report` ships with Nsight Compute, not pip), and they only add "
-                    "value over `ncu-details.txt` for per-line stall attribution.\n"
-                    if nsight
-                    else "Skip its `helpers/*.py`: they import `ncu_report`, which is not "
-                    "installed here.\n"
-                )
-                ref = f"{ncu_dir}/reference"
-                skill_note = (
-                    "\nFor deeper interpretation — the six analysis dimensions and a "
-                    f"signal→cause→fix playbook — read `{ref}/05-analysis-dimensions.md` "
-                    f"and `{ref}/06-diagnosis-playbook.md`.\n"
-                    f"Every link inside those files is relative: resolve it against "
-                    f"`{ncu_dir}/`. Ignore `{ncu_dir}/SKILL.md`'s collection workflow — it "
-                    "assumes a local GPU, and yours is remote.\n" + helper_note
-                )
-            parts.append(
-                prompts.load_and_render_safe(
-                    "claude/kernel-tools-popcorn-ncu.md",
-                    "",
-                    PYTHON=pyexe,
-                    NCU_SKILL_NOTE=skill_note,
-                    POPCORN_BIN=popcorn.popcorn_bin(pop) or "popcorn",
-                    PROFILER_URL=popcorn.brev_profiler_url(),
-                    LEADERBOARD=pop.leaderboard,
-                    BENCHMARK_INDEX=pop.benchmark_index,
-                    SUBMISSION_FILE=pop.submission_file,
-                    SCORE_CMD=self._score_cmd_str(),
-                )
+        # Unconditional, unlike the blocks around it. This one carries the scoring
+        # command and the submission rules as well as the profile, and a popcorn problem
+        # cannot be worked on without them -- gating it on cfg.ncu (as the profiling
+        # how-to it replaced was) would leave `--no-ncu` agents unable to score at all.
+        # cfg.ncu now narrows to what it names: the interpretation skill pointer.
+        #
+        # The skill is a git submodule and is routinely uninitialised; pointing an agent
+        # at a SKILL.md that is not there just burns a turn. Reading the capture does not
+        # depend on it, so only the pointer is dropped.
+        #
+        # SKILL.md's links are all relative and its workflow assumes a local GPU (build a
+        # .cu harness, run ncu, parse with ncu_report) -- neither is true here, so the
+        # pointer has to say so or the agent follows it off a cliff.
+        skill_note = ""
+        if self.cfg.ncu and _vendored(ncu_dir):
+            nsight = _ncu_report_pythonpath()
+            helper_note = (
+                f"Its `helpers/*.py` need `PYTHONPATH={nsight}` "
+                "(`ncu_report` ships with Nsight Compute, not pip), and they only add "
+                "value over `ncu-details.txt` for per-line stall attribution.\n"
+                if nsight
+                else "Skip its `helpers/*.py`: they import `ncu_report`, which is not "
+                "installed here.\n"
             )
+            ref = f"{ncu_dir}/reference"
+            skill_note = (
+                "\nFor deeper interpretation — the six analysis dimensions and a "
+                f"signal→cause→fix playbook — read `{ref}/05-analysis-dimensions.md` "
+                f"and `{ref}/06-diagnosis-playbook.md`.\n"
+                f"Every link inside those files is relative: resolve it against "
+                f"`{ncu_dir}/`. Ignore `{ncu_dir}/SKILL.md`'s collection workflow — it "
+                "assumes a local GPU, and yours is remote.\n" + helper_note
+            )
+        parts.append(
+            prompts.load_and_render_safe(
+                "claude/kernel-tools-profile.md",
+                "",
+                NCU_SKILL_NOTE=skill_note,
+                SUBMISSION_FILE=pop.submission_file,
+                SCORE_CMD=self._score_cmd_str(),
+            )
+        )
         # veloq turns the .ncu-rep the profiler already downloads into structured
         # evidence. Gated on the binary *and* its bundled reader: the Nsight installed
         # here is too old to open a capture from the hosted profiler (see
@@ -484,6 +484,7 @@ class Orchestrator:
                     "claude/kernel-tools-veloq.md",
                     "",
                     VELOQ_BIN=veloq_bin,
+                    REPORT=f"{popcorn.PROFILE_DIR}/{popcorn.PROFILE_SUBDIR}/profile.ncu-rep",
                     SUBMISSION_FILE=pop.submission_file,
                     PTX_NOTE=self._ptx_note(ptx_dir),
                     VELOQ_REF_NOTE=self._veloq_ref_note(veloq_skill),

@@ -188,9 +188,12 @@ Consequences worth knowing before editing it:
 - Scoring is **two** submissions — `--mode test`, then `--mode benchmark` only if test passed. A
   broken kernel never pays for a benchmark. `correct` is the conjunction: benchmark re-checks every
   shape, so a kernel that only breaks at scale still fails.
-- **Nothing local touches a GPU.** `kernelthing score` takes only `[dir]` and `--test-only`; there is
-  no `--gpu` / baseline plumbing. The metric is an absolute time, so there is no baseline to pin —
-  `_evolve_seed` scores the seed once and moves on.
+- **...plus an Nsight Compute capture, fired the moment the test passes and joined after the
+  benchmark returns** (`profile_submission`, `PROFILE_TIMEOUT_S`). Agents no longer decide to
+  profile; every full score arrives with one. Details in "Automatic profiling" below.
+- **Nothing local touches a GPU.** `kernelthing score` takes `[dir]`, `--test-only` and
+  `--profile`/`--no-profile`; there is no `--gpu` / baseline plumbing. The metric is an absolute
+  time, so there is no baseline to pin — `_evolve_seed` scores the seed once and moves on.
 - The metric is a **time in microseconds, so these problems set `direction: minimize`.**
   `bench.popcorn.metric_mode` picks *which* time: `shape` (one `benchmark_index`, the default — a
   per-shape specialisation leaves the other entries constant and a whole-board geomean would bury
@@ -222,26 +225,31 @@ Consequences worth knowing before editing it:
   order, which is **not stable** — 26 of 54 real captures print secret first. `parse_leaderboard_score_s`
   matches on scope for that reason; taking the first line would silently score against the secret
   seed half the time.
-- **Two timeout budgets** (`TEST_TIMEOUT_S` 300, `timeout_s` 1200). Measured: test 11s, benchmark
-  275s over 15 shapes; the server caps a shape at 180s so a slow kernel can approach 2700s. Their
-  sum must stay under `_cli_score`'s 1800s kill of the whole scoring process.
-- Submissions are **cached on the submission file's sha256** (`_cache_path`). An agent self-tests
-  and the orchestrator then scores the commit it produced, usually byte-identical — the cache
-  roughly halves a run's remote traffic. `KERNELTHING_POPCORN_CACHE` relocates it,
-  `KERNELTHING_POPCORN_BIN` overrides the binary (tests point it at a stub).
-- The agent's tool prompt is `prompts/claude/kernel-tools-popcorn-ncu.md` — see
+- **Three timeout budgets** (`TEST_TIMEOUT_S` 300, `timeout_s` 1200, `PROFILE_TIMEOUT_S` 1200).
+  Measured: test 11s, benchmark 275s over 15 shapes; the server caps a shape at 180s so a slow
+  kernel can approach 2700s. The profile runs *concurrently* with the benchmark, so the pair costs
+  `max(timeout_s, PROFILE_TIMEOUT_S)` — keep those two equal and the total stays 300 + 1200, under
+  `_cli_score`'s 1800s kill of the whole scoring process. Raise either alone and it starts killing
+  scores mid-poll.
+- Submissions are **cached on the submission file's sha256** (`_cache_path`; captures separately in
+  `_profile_cache_path`). `KERNELTHING_POPCORN_CACHE` relocates it, `KERNELTHING_POPCORN_BIN`
+  overrides the binary (tests point it at a stub). **The cache is read-only to agents**: bwrap
+  ro-binds everything but the worktree, so an agent's own `kernelthing score` loads from it and
+  silently fails to store (`_cache_store` swallows the `OSError` by design). Only the orchestrator's
+  out-of-sandbox `_cli_score` populates it — in the 2026-07-24 run exactly 1 of 18 orchestrator
+  scores was a hit, so do not count on it to halve anything.
+- The agent's tool prompt is `prompts/claude/kernel-tools-profile.md` — see
   `Orchestrator._kernel_tools_block`, which returns `""` for a problem with no popcorn config
-  (such a problem cannot be scored at all, so there is nothing to tell it). The local-GPU variant
-  (`kernel-tools-ncu.md`) and the shared-GPU arbitration notice described the removed local
-  benchmark stack and are deleted. Profiling is `popcorn submit --profile-brev`, not local `ncu`.
-- **`popcorn` extracts captures relative to its own cwd, not to `--output`.** Passing
-  `--output profile/brev.json` from the worktree root puts `brev.json` under `profile/` but drops
-  `profile.<index>-<spec-slug>/` at the *root*. Hence two ignore rules per problem (`profile/` **and**
-  `profile.*/`) — the bare `profile/` left `ncu-details.{csv,txt}` committable. The prompt therefore
-  tells agents to run it from the root with `--output brev.json` and no `cd`; it also warns that
-  opencode validates the bash tool's `workdir` *before* running the command, so the natural
-  `mkdir -p profile` + `workdir: profile` yields `NotFound: FileSystem.access` (it cost three
-  members two turns each in the 2026-07-24 run).
+  (such a problem cannot be scored at all, so there is nothing to tell it). That block is
+  **unconditional**, unlike the ones around it: it carries the scoring command and the submission
+  rules, so gating it (as its `kernel-tools-popcorn-ncu.md` predecessor was gated on `cfg.ncu`)
+  would leave `--no-ncu` agents unable to score. `cfg.ncu` now gates only the interpretation-skill
+  pointer.
+- **`popcorn` extracts captures relative to its own cwd, not to `--output`.** `profile_submission`
+  runs it in a `TemporaryDirectory` and moves the result, exactly as `submit` already did, which is
+  why nothing lands at the worktree root any more and why the `workdir` trap is gone. The two ignore
+  rules per problem (`profile/` **and** `profile.*/`) stay: `profile/` is where the scorer now puts
+  captures, and `profile.*/` still catches anything run by hand.
 - **`ncu_report` ships inside Nsight Compute, not on PyPI** — `pip install ncu_report` does not
   exist. Every `helpers/*.py` in `vendor/ncu-report-skill` imports it, so the whole helper toolchain
   is dead unless the prompt names the path. `_ncu_report_pythonpath()` globs the install tree
@@ -273,9 +281,48 @@ Consequences worth knowing before editing it:
   them. `torch`/`numpy` are deliberately absent, which is why agents that try a local sanity check
   hit `ModuleNotFoundError` instead of a wrong answer — a good failure, worth keeping.
 
+### Automatic profiling (`popcorn.profile_submission`, `profile_digest`)
+
+Profiling used to be an option in the agent's prompt, and the 2026-07-24 run measured what that
+cost: of 25 members, **15 tried it and 12 got a capture**. Four were killed by opencode's bash
+tool — the *model* chose `timeout: 360000` on 8 of 23 calls and every one of the run's kills was
+one of those, while all 15 calls at 420000+ finished. The service never killed a job. Worse, a
+kill still pays: the brev job runs to completion server-side and the CLI downloads artifacts only
+after it sees `succeeded`. Three more members lost turns to the `workdir` trap.
+
+So the harness takes it. `bench.popcorn.profile` (default **true**) makes every full score capture
+the scored shape:
+
+- **Fired at test-pass, joined after the benchmark** — the two overlap. The profile is the long
+  pole (245–270s alone, 515s observed behind a queue) and the benchmark is ~172s, so overlapping
+  costs the difference rather than the sum. A broken kernel returns before the capture starts and
+  never takes a slot in the queue.
+- **`--test-only` never profiles by default.** It is the ~10s call an agent makes most while
+  iterating on correctness; a capture would make it ~25× slower and there is no timing to reason
+  about yet. `kernelthing score --profile` forces one; `--no-profile` suppresses it.
+- **It is evidence, not a verdict.** Every failure path in `profile_submission` returns a `Profile`
+  with `ok=False` and an `error`; none raise. The join is in a `finally`, so no exit path leaks the
+  thread. Losing a capture must never change whether a kernel scored.
+- **The digest, not the dump, is what the agent sees.** `profile_digest` cuts a 21KB `--set full`
+  capture to ~12KB by keeping the launch header, four sections (Speed Of Light, Launch Statistics,
+  Occupancy, Warp State) and *every* `OPT`/`INF`/`WRN` finding — the findings are what name a
+  bottleneck. Unparseable input returns `""`; a profiler that changes format costs a digest, not a
+  score.
+- **`brev_defuse` hyphenates the evaluator's rejected substring** before any of this reaches an
+  agent. Nsight prints it once per kernel header, and quoting a capture verbatim would hand the
+  agent a string that silently poisons any file it lands in.
+- **The verdict JSON carries paths, never capture text** (`Profile.record`). The JSON line is the
+  seam; a 12KB digest crossing it would land in every `result.json` and every journal event on
+  every score. `score_command` prints the digest to stdout **above** the verdict instead, because
+  `_cli_score` finds the JSON by scanning stdout in reverse for the last line starting with `{`.
+
+`tests/fixtures/popcorn/ncu-details.txt` is a verbatim capture (index 2 of the cholesky board,
+recovered from member 10's `opencode.ndjson`). Re-capture rather than hand-edit, like the
+`--output` fixtures beside it.
+
 ### Reading the capture: `veloq`, and the version trap (`config.veloq_python`)
 
-`--profile-brev` downloads a `profile.ncu-rep` alongside `ncu-details.txt`. The text file is
+The scorer writes `profile/latest/{ncu-details.txt,digest.txt,profile.ncu-rep}`. The text file is
 a rounded rendering; the report holds the same capture structured — per-launch metrics, the
 profiler's rule findings with severities and `focus_metrics`, and per-source-line warp-stall
 histograms. `veloq ncu <verb>` reads it, **on this box, with no GPU** — it is a file parser.
@@ -385,7 +432,7 @@ no longer exist:
 
 - `prompts/claude/bootstrap-problem.md`, `bootstrap-mode-{auto,interactive}.md` — loaded by
   `bootstrap.py`.
-- `prompts/claude/kernel-tools-{wiki,popcorn-ncu}.md` — loaded by `Orchestrator._kernel_tools_block`.
+- `prompts/claude/kernel-tools-{wiki,profile,veloq,cuda-docs}.md` — loaded by `Orchestrator._kernel_tools_block`.
 - `prompts/block/*.md` (20) — rendered by `guard_core.js`, one per `block(cfg, "<name>", ...)` call.
   `render()` falls back to the inline message when a file is missing, so a stale name degrades
   quietly; that is also why an unreferenced template is invisible until you go looking.

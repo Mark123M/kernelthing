@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from kernelthing import opencode_client
 from kernelthing.config import Config, veloq_python
 from kernelthing.opencode_client import _seed_auth_for_isolated_data, build_opencode_env
 from kernelthing.orchestrator import Orchestrator, _ncu_report_pythonpath
@@ -172,6 +173,22 @@ def test_auth_seeding_survives_a_partial_source(tmp_path):
     assert not (dst / "opencode" / "mcp-auth.json").exists()
 
 
+def test_bash_timeout_default_clears_a_hosted_profile(monkeypatch):
+    # opencode's bash tool caps a command at 120s by default. A hosted --profile-brev
+    # run is 245-270s alone and longer behind a queue, so on the default every profile
+    # dies mid-poll -- and silently: the job finishes server-side, but the CLI downloads
+    # the artifacts only after it sees `succeeded`, so the loop pays and gets nothing.
+    monkeypatch.delenv(opencode_client.BASH_TIMEOUT_ENV, raising=False)
+    env, _ = build_opencode_env(data_dir=Path("/tmp/kt-xdg-probe"))
+    assert int(env[opencode_client.BASH_TIMEOUT_ENV]) >= 600_000
+
+
+def test_bash_timeout_defers_to_an_operator_override(monkeypatch):
+    monkeypatch.setenv(opencode_client.BASH_TIMEOUT_ENV, "42")
+    env, _ = build_opencode_env(data_dir=Path("/tmp/kt-xdg-probe"))
+    assert env[opencode_client.BASH_TIMEOUT_ENV] == "42"
+
+
 def test_veloq_env_pin_defers_to_an_operator_override(monkeypatch):
     # An explicitly exported VELOQ_PYTHON wins: the agent inherits the parent env
     # verbatim by design, and the pin only fills the gap the XDG repoint creates.
@@ -182,9 +199,22 @@ def test_veloq_env_pin_defers_to_an_operator_override(monkeypatch):
 
 # --- the ignore rules must match the layout popcorn actually produces ---
 
-# popcorn names the extracted capture after the shape, at the cwd it ran in.
+# What `kernelthing score` now writes for every full score (popcorn.PROFILE_DIR /
+# PROFILE_SUBDIR). These are 80MB of .ncu-rep per candidate; a problem whose .gitignore
+# missed them would commit one per member.
+_SCORER_ARTIFACTS = (
+    "profile/latest/ncu-details.txt",
+    "profile/latest/digest.txt",
+    "profile/latest/profile.ncu-rep",
+    "profile/latest/profile.ncu-rep.veloq/ncu-native.json.gz",
+)
+
+# popcorn names the extracted capture after the shape, at the cwd it ran in. The scorer
+# no longer lets that reach the worktree (it extracts in a temp dir), but a capture taken
+# by hand still lands this way, so the rule has to keep covering it.
 # The `.veloq/` sidecar is written next to the report the first time veloq reads it.
 _ARTIFACTS = (
+    *_SCORER_ARTIFACTS,
     "profile.2-batch-256-n-128-cond-2-seed-41128/ncu-details.csv",
     "profile.2-batch-256-n-128-cond-2-seed-41128/ncu-details.txt",
     "profile.2-batch-256-n-128-cond-2-seed-41128/profile.ncu-rep",
