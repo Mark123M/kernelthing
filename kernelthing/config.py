@@ -104,7 +104,6 @@ class Config:
     # the profile is not gated here at all -- every full ``kernelthing score`` takes one
     # (``bench.popcorn.profile``), in a separate process that never sees this Config.
     ncu: bool = True
-    wiki: bool = True
     # veloq: read the downloaded .ncu-rep as structured JSON instead of grepping the
     # flat text dump. Needs the binary and its bundled reader (see veloq_python).
     veloq: bool = True

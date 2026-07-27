@@ -76,7 +76,6 @@ def command(argv: list[str]) -> int:
         help="opencode model id to compose the prompt for (default: %(default)s)",
     )
     parser.add_argument("--no-ncu", action="store_true", help="omit the ncu analysis-skill note")
-    parser.add_argument("--no-wiki", action="store_true", help="omit the KernelWiki block")
     parser.add_argument("--no-veloq", action="store_true", help="omit the veloq block")
     parser.add_argument("--no-ptx", action="store_true", help="omit the PTX reference block")
     parser.add_argument("--no-cuda-docs", action="store_true", help="omit CUDA-docs MCP guidance")
@@ -87,7 +86,6 @@ def command(argv: list[str]) -> int:
         cfg = Config(
             model=args.model,
             ncu=not args.no_ncu,
-            wiki=not args.no_wiki,
             veloq=not args.no_veloq,
             ptx=not args.no_ptx,
             mcp_cuda_docs=not args.no_cuda_docs,
@@ -307,16 +305,6 @@ def render_kernel_tools(cfg: Config) -> str:
                 NSYS_VERBS=popcorn.veloq_verb_block("nsys"),
             )
         )
-
-    if cfg.wiki:
-        parts.append(
-            prompts.load_and_render_safe(
-                "claude/kernel-tools-wiki.md",
-                "",
-                PYTHON="{{PYTHON}}",
-                WIKI_DIR="{{WIKI_DIR}}",
-            )
-        )
     return Orchestrator._tools_section(parts)
 
 
@@ -533,7 +521,6 @@ def build_manifest(problem: Problem, cfg: Config, operators: list[str]) -> JSOND
         "operators": operators,
         "flags": {
             "ncu": cfg.ncu,
-            "wiki": cfg.wiki,
             "veloq": cfg.veloq,
             "ptx": cfg.ptx,
             "mcp_cuda_docs": cfg.mcp_cuda_docs,
@@ -566,8 +553,6 @@ def source_inventory(cfg: Config) -> JSONDict:
         "kernelthing/orchestrator.py:EVOLVE_EXPLOIT_PROMPT",
         "kernelthing/orchestrator.py:EVOLVE_DESCRIPTOR_FOOTER",
     ]
-    if cfg.wiki:
-        prompt_files.append("prompts/claude/kernel-tools-wiki.md")
     prompt_files.append("prompts/claude/kernel-tools-profile.md")
     if cfg.veloq:
         prompt_files.append("prompts/claude/kernel-tools-veloq.md")

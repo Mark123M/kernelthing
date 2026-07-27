@@ -436,8 +436,6 @@ class Orchestrator:
             return ""
 
         parts: list[str] = []
-        pyexe = sys.executable or "python3"
-        wiki_dir = REPO_ROOT / "vendor" / "KernelWiki"
         ncu_dir = REPO_ROOT / "vendor" / "ncu-report-skill"
         # Ordering is three bands: what the agent *does* every turn, then the reference
         # material it consults when stuck, then the command surfaces it types. Commands
@@ -549,15 +547,6 @@ class Orchestrator:
                         f"{popcorn.NSYS_SUBDIR}/profile.nsys-rep"
                     ),
                     NSYS_VERBS=popcorn.veloq_verb_block("nsys"),
-                )
-            )
-        if self.cfg.wiki and _vendored(wiki_dir):
-            parts.append(
-                prompts.load_and_render_safe(
-                    "claude/kernel-tools-wiki.md",
-                    "",
-                    PYTHON=pyexe,
-                    WIKI_DIR=str(wiki_dir),
                 )
             )
         return self._tools_section(parts)

@@ -37,7 +37,8 @@ python -m kernelthing ...              # equivalent to the `kernelthing` entry p
 
 **Submodules:** `git submodule update --init` (the README's command) **fails** — `problems/zo_double_gemm_silu_layernorm`
 is a gitlink with no `.gitmodules` entry. Scope it instead:
-`git submodule update --init vendor/KernelWiki vendor/ncu-report-skill`.
+`git submodule update --init vendor/ncu-report-skill`. (`vendor/KernelWiki` is still declared in
+`.gitmodules` but nothing loads it — the block that offered it to agents was removed 2026-07-27.)
 
 **Pure-Python install.** There is no native build step and no compiled dependency — the package is
 pure Python. `pip install -e '.[dev]'` needs no C compiler, CUDA, or torch. Scoring is remote, so the
@@ -624,7 +625,7 @@ no longer exist:
 
 - `prompts/claude/bootstrap-problem.md`, `bootstrap-mode-{auto,interactive}.md` — loaded by
   `bootstrap.py`.
-- `prompts/claude/kernel-tools-{wiki,profile,veloq,nsys,skill,cuda-docs}.md` — loaded by
+- `prompts/claude/kernel-tools-{profile,veloq,nsys,skill,cuda-docs}.md` — loaded by
   `Orchestrator._kernel_tools_block`. One section per tool surface; `veloq` is the Nsight Compute
   half and `nsys` the Nsight Systems half, split so the latter can be dropped whole for a problem
   with `bench.popcorn.nsys` off. `skill.md` is a two-line template (`### {{SKILL_TITLE}}` +
@@ -637,7 +638,7 @@ no longer exist:
 
   1. *the turn loop* — Timing / Profiling / Rules (`profile.md`, one file, three `###`s)
   2. *reference* — ncu-profile-analysis, ncu-report-skill, nsys-profile-analysis, CUDA-docs MCP, ptx-skill
-  3. *commands* — `veloq ncu`, `veloq nsys`, KernelWiki
+  3. *commands* — `veloq ncu`, `veloq nsys`
 
   Commands last is the recency slot: this block sits immediately above the task. That the
   skills interpreting a report precede the verbs producing it is fine — every section is

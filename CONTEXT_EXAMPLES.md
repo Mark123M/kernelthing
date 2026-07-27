@@ -209,6 +209,10 @@ Keep it under 1000 characters.
 
 ### 2.4 KernelWiki tools block (`prompts/claude/kernel-tools-wiki.md`, rendered)
 
+> **Removed 2026-07-27** — too ML-focused for a linalg board. The prompt file, `cfg.wiki` and
+> `--no-wiki` are gone, so no candidate receives this block any more. Kept here because it *was*
+> in the context of the run this document captures; §A3/§A4 below are void for the same reason.
+
 ````markdown
 ---
 
@@ -844,6 +848,8 @@ KernelWiki (§2.4) is the same story in reverse: the *pitch and query commands* 
 (~230 words), but no wiki content is — only paths.
 
 ## A3. KernelWiki structure, and adding linalg / MAGMA
+
+*(Void — the block was removed 2026-07-27; see §2.4. Retained as a record of what was measured.)*
 
 Three layers (`vendor/KernelWiki/CLAUDE.md`):
 

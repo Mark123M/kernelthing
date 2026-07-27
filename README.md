@@ -15,7 +15,7 @@ is rather different and has many more features.
 
 ```bash
 python -m pip install -e .
-git submodule update --init # fetch vendored KernelWiki + ncu-report-skill
+git submodule update --init vendor/ncu-report-skill # fetch the vendored ncu skill
 
 # external prerequisites
 opencode --version     # CLI agent on PATH + DEEPSEEK_API_KEY
@@ -134,13 +134,10 @@ sandbox. Network stays up (the model API and the popcorn service need it); the
 filesystem is the confinement boundary. opencode's `--dangerously-skip-permissions`
 is only safe because of this.
 
-## Kernel tooling (KernelWiki + profiling)
+## Kernel tooling (profiling references)
 
-Two vendored [KDA](https://github.com/mit-han-lab/kernel-design-agents) skills
-(git submodules under `vendor/`), injected into the agent's prompt:
+Vendored skills under `vendor/`, surfaced as paths in the agent's prompt:
 
-- **KernelWiki** (`vendor/KernelWiki`) — Blackwell/Hopper kernel-optimization
-  knowledge base (read-only query).
 - **ncu-report-skill** (`vendor/ncu-report-skill`) — B200/sm_100 analysis
   dimensions, a signal→cause→fix playbook, and sm_100 metric names. Prose only:
   its collection workflow and `helpers/` assume a local GPU.
@@ -148,7 +145,7 @@ Two vendored [KDA](https://github.com/mit-han-lab/kernel-design-agents) skills
   `vendor/veloq-nsys-skill`) — how to interrogate the two reports with `veloq`.
 - **ptx-skill** (`vendor/ptx-skill`) — PTX/CUDA ISA reference.
 
-Disable with `--no-wiki` / `--no-ncu` / `--no-veloq` / `--no-ptx`.
+Disable with `--no-ncu` / `--no-veloq` / `--no-ptx`.
 
 A full remote score automatically overlaps timing with two profiles of the scored shape:
 hosted Nsight Compute via popcorn, and a minimal Modal/B200 Nsight Systems timeline for

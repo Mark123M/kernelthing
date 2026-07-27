@@ -115,7 +115,6 @@ def run_loop(args: argparse.Namespace) -> int:
         parallelism=args.parallelism,
         kernelguard=not args.no_kernelguard,
         ncu=not args.no_ncu,
-        wiki=not args.no_wiki,
         veloq=not args.no_veloq,
         ptx=not args.no_ptx,
         mcp_cuda_docs=not args.no_cuda_docs,
@@ -631,11 +630,6 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="don't offer the agent the Nsight Compute (ncu) skill for reading "
         "the remote popcorn --profile-brev reports",
-    )
-    tools.add_argument(
-        "--no-wiki",
-        action="store_true",
-        help="don't offer the agent the KernelWiki kernel-optimization knowledge base",
     )
     tools.add_argument(
         "--no-veloq",

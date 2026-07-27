@@ -18,14 +18,14 @@ def test_basic_substitution():
 
 
 def test_load_real_prompt_renders_placeholders():
-    # A live prompt loads and substitutes. kernel-tools-wiki.md is one the
+    # A live prompt loads and substitutes. kernel-tools-veloq.md is one the
     # orchestrator actually renders -- the fixture is deliberately not a
     # legacy file, so this test dies with the feature rather than outliving it.
-    text = prompts.load("claude/kernel-tools-wiki.md")
-    assert text, "kernel-tools-wiki.md should be present"
-    rendered = prompts.render(text, PYTHON="/usr/bin/python3", WIKI_DIR="/vendor/KernelWiki")
-    assert "/vendor/KernelWiki/scripts/query.py" in rendered
-    assert "{{WIKI_DIR}}" not in rendered
+    text = prompts.load("claude/kernel-tools-veloq.md")
+    assert text, "kernel-tools-veloq.md should be present"
+    rendered = prompts.render(text, VELOQ_BIN="/usr/bin/veloq", REPORT="profile/p.ncu-rep")
+    assert "V=/usr/bin/veloq; REP=profile/p.ncu-rep" in rendered
+    assert "{{VELOQ_BIN}}" not in rendered
 
 
 def test_working_set_has_no_role_word_claude():
@@ -112,7 +112,6 @@ def test_the_tools_block_is_ordered_turn_loop_then_reference_then_commands():
         "PTX / CUDA ISA reference — `ptx-skill`",
         "Reading the Nsight Compute report — `veloq ncu`",
         "Reading the Nsight Systems timeline — `veloq nsys`",
-        "KernelWiki — Blackwell/Hopper kernel-optimization knowledge base",
     ]
     assert block.index("### Profiling") < block.index("### Reading the Nsight Compute")
     assert block.index("### Reading the Nsight Compute") < block.index(

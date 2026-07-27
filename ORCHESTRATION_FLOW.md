@@ -261,7 +261,8 @@ seed.
                    ▼
         + EVOLVE_DESCRIPTOR_FOOTER   (self-test command, "commit as soon as you have
         |                             ANY correct improvement", write candidate-summary.md)
-        + _kernel_tools_block        (KernelWiki, remote popcorn --profile-brev — cached per run)
+        + _kernel_tools_block        (scoring + profiling surfaces, vendored skill
+        |                             pointers, veloq verbs — cached per run)
 ```
 
 These four templates are **inline constants in `orchestrator.py`**, not files under `prompts/`.
