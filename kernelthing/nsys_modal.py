@@ -1,9 +1,9 @@
-"""Modal B200 Nsight Systems capture for one Cholesky submission.
+"""Modal B200 execution and Nsight Systems capture for one Cholesky submission.
 
 This module is intentionally optional: normal kernelthing imports do not touch
-``modal``. ``popcorn.profile_nsys_submission`` shells out to ``modal run`` only
-after a full score has passed correctness, and treats every failure here as an
-unavailable profile rather than a failed score.
+``modal``. ``popcorn.deadlock_check_submission`` uses it for one exact-shape
+kernel call, while ``popcorn.profile_nsys_submission`` uses it for a warmed
+Nsight Systems capture.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ RUNNER = r"""
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 import torch
@@ -42,6 +43,7 @@ def main() -> None:
     parser.add_argument("--batch", type=int, required=True)
     parser.add_argument("--n", type=int, required=True)
     parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--completion-check", action="store_true")
     args = parser.parse_args()
 
     sys.path.insert(0, "/workspace")
@@ -79,6 +81,28 @@ def main() -> None:
     del d, v, w, s
     torch.cuda.synchronize()
 
+    if args.completion_check:
+        print("kernelthing: exact-shape custom_kernel launch starting", flush=True)
+        with torch.no_grad():
+            out = submission.custom_kernel(data)
+        torch.cuda.synchronize()
+        if not hasattr(out, "shape") or tuple(out.shape) != (args.batch, args.n, args.n):
+            raise RuntimeError(
+                "custom_kernel returned "
+                f"{type(out).__name__}, expected shape {(args.batch, args.n, args.n)}"
+            )
+        print(
+            json.dumps(
+                {
+                    "kind": "kernelthing-modal-kernel-run",
+                    "status": "passed",
+                    "shape": [args.batch, args.n, args.n],
+                }
+            ),
+            flush=True,
+        )
+        return
+
     with torch.no_grad():
         out = submission.custom_kernel(data)
     torch.cuda.synchronize()
@@ -107,6 +131,116 @@ import torch
 input_t = torch.Tensor
 output_t = torch.Tensor
 """
+
+
+@app.function(image=image, gpu="B200", timeout=300)
+def check_cholesky(
+    source: str,
+    batch: int,
+    n: int,
+    seed: int,
+    timeout_s: int,
+) -> dict[str, object]:
+    """Run ``custom_kernel`` once at the scored shape with a hard execution cap."""
+    import os
+    import subprocess
+    import sys
+    import time
+
+    work = Path("/workspace")
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "submission.py").write_text(source, encoding="utf-8")
+    (work / "task.py").write_text(TASK, encoding="utf-8")
+    (work / "runner.py").write_text(RUNNER, encoding="utf-8")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(work)
+    command = [
+        sys.executable,
+        str(work / "runner.py"),
+        "--batch",
+        str(batch),
+        "--n",
+        str(n),
+        "--seed",
+        str(seed),
+        "--completion-check",
+    ]
+    started = time.monotonic()
+    try:
+        ran = subprocess.run(
+            command,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        wall_s = time.monotonic() - started
+        stderr = (
+            exc.stderr.decode(errors="replace")
+            if isinstance(exc.stderr, bytes)
+            else (exc.stderr or "")
+        )
+        stdout = (
+            exc.stdout.decode(errors="replace")
+            if isinstance(exc.stdout, bytes)
+            else (exc.stdout or "")
+        )
+        tail = (stderr + stdout).strip()[-500:]
+        launched = "exact-shape custom_kernel launch starting" in (stderr + stdout)
+        if not launched:
+            return {
+                "kind": "kernelthing-deadlock-check",
+                "status": "failed",
+                "ok": False,
+                "timed_out": False,
+                "wall_s": wall_s,
+                "error": (
+                    f"exact-shape Modal setup exceeded {timeout_s}s before custom_kernel "
+                    f"launched for batch={batch}, n={n}, seed={seed}; this is not a "
+                    "classified GPU kernel deadlock"
+                ),
+                "tail": tail,
+            }
+        return {
+            "kind": "kernelthing-deadlock-check",
+            "status": "timed_out",
+            "ok": False,
+            "timed_out": True,
+            "wall_s": wall_s,
+            "error": (
+                f"exact-shape Modal run exceeded {timeout_s}s while "
+                f"executing custom_kernel for batch={batch}, n={n}, seed={seed}; "
+                "likely GPU kernel deadlock (or an exceptionally slow compile/launch). "
+                "Do not start NCU or NSYS for this kernel."
+            ),
+            "tail": tail,
+        }
+
+    wall_s = time.monotonic() - started
+    tail = ((ran.stderr or "") + (ran.stdout or "")).strip()[-500:]
+    if ran.returncode != 0:
+        return {
+            "kind": "kernelthing-deadlock-check",
+            "status": "failed",
+            "ok": False,
+            "timed_out": False,
+            "wall_s": wall_s,
+            "error": (
+                f"exact-shape Modal run failed for batch={batch}, n={n}, seed={seed} "
+                f"(exit {ran.returncode}): {tail}"
+            ),
+        }
+    return {
+        "kind": "kernelthing-deadlock-check",
+        "status": "passed",
+        "ok": True,
+        "timed_out": False,
+        "wall_s": wall_s,
+        "shape": [batch, n, n],
+        "error": "",
+    }
 
 
 @app.function(image=image, gpu="B200", timeout=3600, volumes={"/cache": cache_vol})
@@ -197,13 +331,26 @@ def profile_cholesky(
 @app.local_entrypoint()
 def main(
     submission: str,
-    output: str,
     batch: int,
     n: int,
     seed: int,
+    output: str = "",
     digest: str = "",
+    completion_check: bool = False,
+    deadlock_timeout_s: int = 120,
 ) -> None:
     source = Path(submission).read_text(encoding="utf-8")
+    if completion_check:
+        print(
+            json.dumps(
+                check_cholesky.remote(source, batch, n, seed, deadlock_timeout_s)
+            ),
+            flush=True,
+        )
+        return
+    if not output:
+        raise ValueError("--output is required unless --completion-check is set")
+
     run_name, artifacts = profile_cholesky.remote(source, batch, n, seed, digest)
 
     destination = Path(output)

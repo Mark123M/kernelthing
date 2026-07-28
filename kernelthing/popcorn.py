@@ -123,6 +123,13 @@ MODE_NSYS = "nsys"
 # full wait, because the CLI downloads artifacts only once the job reports `succeeded`.
 PROFILE_TIMEOUT_S = 1200
 
+# One exact-shape Modal call used before an agent risks the shared profiler queues.
+# The 120s cap lives inside the Modal function, around the child process that imports
+# and calls the submission. This larger client cap leaves room for Modal scheduling and
+# image startup; hitting it is infrastructure failure, not evidence of a kernel deadlock.
+DEADLOCK_CHECK_TIMEOUT_S = 120
+DEADLOCK_CHECK_CLIENT_TIMEOUT_S = 300
+
 # Where the capture lands inside the worktree. Every problem's .gitignore already covers
 # `profile/` (test_harness_deps asserts it), so the artifacts cannot reach a commit. It
 # cannot live in the submission cache instead: the sandbox ro-binds everything except the
@@ -268,6 +275,10 @@ class PopcornConfig:
     # Separate from ``profile`` so operators can keep the existing ncu path without
     # Modal, or vice versa. ``kernelthing score --no-profile`` still disables both.
     nsys: bool = True
+    # Run one unprofiled Modal/B200 call at benchmark_spec before the Popcorn
+    # correctness suite in --test-only mode. Enabled by default for the Cholesky
+    # leaderboard, the only runner supported by the current Modal harness.
+    deadlock_check: bool = True
 
     @property
     def timing_mode(self) -> str:
@@ -370,6 +381,7 @@ def resolve_config(problem: Problem) -> PopcornConfig:
         bin=str(raw.get("bin", "")),
         profile=bool(raw.get("profile", True)),
         nsys=bool(raw.get("nsys", True)),
+        deadlock_check=bool(raw.get("deadlock_check", leaderboard == "cholesky")),
     )
 
 
@@ -934,6 +946,31 @@ class NsysProfile:
         return d
 
 
+@dataclass
+class DeadlockCheck:
+    """One unprofiled Modal/B200 call at the exact scored Cholesky shape."""
+
+    ok: bool = False
+    status: str = "failed"
+    batch: int = 0
+    n: int = 0
+    seed: int = 0
+    wall_s: float = 0.0
+    timed_out: bool = False
+    error: str = ""
+
+    def record(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "deadlock_check": self.status,
+            "ok": self.ok,
+            "shape": f"batch={self.batch}, n={self.n}, seed={self.seed}",
+            "wall_s": round(self.wall_s, 1),
+            "timed_out": self.timed_out,
+            "error": self.error or None,
+        }
+        return d
+
+
 def brev_defuse(text: str, cfg: PopcornConfig) -> str:
     """Break any evaluator-rejected substring in profiler output before an agent sees it.
 
@@ -1161,17 +1198,17 @@ def profile_submission(cfg: PopcornConfig, sub_path: Path, dest: Path, digest: s
     return prof
 
 
-def _cholesky_nsys_args(cfg: PopcornConfig) -> tuple[int, int, int]:
-    """Return ``(batch, n, seed)`` for the Modal nsys harness, or raise."""
+def _cholesky_modal_args(cfg: PopcornConfig) -> tuple[int, int, int]:
+    """Return ``(batch, n, seed)`` for an exact-shape Modal run, or raise."""
     if cfg.leaderboard != "cholesky":
         raise PopcornError(
-            f"Nsight Systems Modal profiling supports only cholesky in v1, not {cfg.leaderboard}"
+            f"Modal exact-shape execution supports only cholesky in v1, not {cfg.leaderboard}"
         )
     fields = spec_fields(cfg.benchmark_spec)
     missing = [name for name in ("batch", "n", "seed") if not fields.get(name)]
     if missing:
         raise PopcornError(
-            "Nsight Systems Modal profiling requires benchmark_spec fields: "
+            "Modal exact-shape execution requires benchmark_spec fields: "
             + ", ".join(missing)
         )
     try:
@@ -1180,15 +1217,118 @@ def _cholesky_nsys_args(cfg: PopcornConfig) -> tuple[int, int, int]:
         seed = int(fields["seed"])
     except ValueError as e:
         raise PopcornError(
-            "Nsight Systems Modal profiling requires integer batch, n, and seed "
+            "Modal exact-shape execution requires integer batch, n, and seed "
             f"in benchmark_spec: {cfg.benchmark_spec}"
         ) from e
     if batch <= 0 or n <= 0:
         raise PopcornError(
-            "Nsight Systems Modal profiling requires positive batch and n "
+            "Modal exact-shape execution requires positive batch and n "
             f"in benchmark_spec: {cfg.benchmark_spec}"
         )
     return batch, n, seed
+
+
+def _deadlock_check_result(text: str) -> dict[str, Any]:
+    """Return the structured line printed by the Modal completion-check mode."""
+    for line in reversed(text.splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("kind") == "kernelthing-deadlock-check":
+            return value
+    return {}
+
+
+def deadlock_check_submission(
+    cfg: PopcornConfig,
+    sub_path: Path,
+) -> DeadlockCheck:
+    """Run ``custom_kernel`` once on Modal/B200 at the exact scored shape.
+
+    This is deliberately not NSYS: its only question is whether one ordinary call
+    returns. The remote runner enforces the 120s child-process timeout and returns a
+    distinct ``timed_out`` status so a kernel deadlock is not confused with Modal auth,
+    scheduling, or startup failure.
+    """
+    check = DeadlockCheck()
+    try:
+        check.batch, check.n, check.seed = _cholesky_modal_args(cfg)
+    except PopcornError as e:
+        check.error = str(e)
+        return check
+
+    exe = modal_bin()
+    if not exe:
+        check.error = "Modal CLI not found on PATH (set KERNELTHING_MODAL_BIN)"
+        return check
+    script = Path(__file__).resolve().with_name("nsys_modal.py")
+    if not script.is_file():
+        check.error = f"Modal exact-shape runner missing: {script}"
+        return check
+
+    print(
+        f"checking benchmark index {cfg.benchmark_index} at its exact shape on Modal/B200 "
+        f"(one kernel call; {DEADLOCK_CHECK_TIMEOUT_S}s deadlock timeout)...",
+        file=sys.stderr,
+    )
+    cmd = [
+        exe,
+        "run",
+        str(script),
+        "--submission",
+        str(sub_path.resolve()),
+        "--batch",
+        str(check.batch),
+        "--n",
+        str(check.n),
+        "--seed",
+        str(check.seed),
+        "--completion-check",
+        "--deadlock-timeout-s",
+        str(DEADLOCK_CHECK_TIMEOUT_S),
+    ]
+    started = time.monotonic()
+    try:
+        ran = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=DEADLOCK_CHECK_CLIENT_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        check.wall_s = time.monotonic() - started
+        check.error = (
+            f"Modal did not return the exact-shape check within "
+            f"{DEADLOCK_CHECK_CLIENT_TIMEOUT_S}s; this is a Modal scheduling/startup "
+            "failure, not a classified kernel deadlock"
+        )
+        return check
+    except OSError as e:
+        check.wall_s = time.monotonic() - started
+        check.error = f"Modal exact-shape check could not start: {e}"
+        return check
+
+    check.wall_s = time.monotonic() - started
+    result = _deadlock_check_result((ran.stdout or "") + "\n" + (ran.stderr or ""))
+    if not result:
+        tail = ((ran.stderr or "") + (ran.stdout or "")).strip()[-500:]
+        check.error = (
+            f"Modal exact-shape check returned no result (exit {ran.returncode}): {tail}"
+        )
+        return check
+
+    check.status = str(result.get("status") or "failed")
+    check.ok = bool(result.get("ok"))
+    check.timed_out = bool(result.get("timed_out"))
+    with contextlib.suppress(TypeError, ValueError):
+        check.wall_s = float(result.get("wall_s", check.wall_s))
+    check.error = str(result.get("error") or "")
+    if ran.returncode != 0 and check.ok:
+        check.ok = False
+        check.status = "failed"
+        check.error = f"Modal CLI exited {ran.returncode} after reporting success"
+    return check
 
 
 def profile_nsys_submission(
@@ -1208,7 +1348,7 @@ def profile_nsys_submission(
         return prof
 
     try:
-        batch, n, seed = _cholesky_nsys_args(cfg)
+        batch, n, seed = _cholesky_modal_args(cfg)
     except PopcornError as e:
         prof.error = str(e)
         return prof
@@ -1495,11 +1635,10 @@ def score(
             ids[mode] = sid
         return sub
 
-    # Default: capture on a full score, never on --test-only. There is nothing to overlap
-    # a profile with on the test path -- it is a ~10s call, so a capture would make it
-    # ~25x slower -- and nothing to reason about either, since --test-only produces no
-    # timing. That is the call an agent iterating on correctness makes most often, and
-    # keeping it cheap is what stops it from being avoided.
+    # Default: capture on a full score, never on --test-only. The test path now starts
+    # with one *unprofiled* exact-shape Modal call, then Popcorn correctness; attaching
+    # NCU/NSYS to that safety gate would defeat its purpose and still produce no timing
+    # to reason about.
     want_profile = (cfg.profile and not test_only) if profile is None else bool(profile)
     want_nsys = (cfg.nsys and not test_only) if profile is None else (bool(profile) and cfg.nsys)
     pool: ThreadPoolExecutor | None = None
@@ -1528,6 +1667,17 @@ def score(
             )
 
     try:
+        if test_only and cfg.deadlock_check:
+            deadlock = deadlock_check_submission(cfg, sub_path)
+            detail["deadlock_check"] = deadlock.record()
+            if not deadlock.ok:
+                return (
+                    False,
+                    None,
+                    deadlock.error or "exact-shape Modal deadlock check failed",
+                    detail,
+                )
+
         test_sub = run(MODE_TEST)
         report = (
             test_report_from_result(test_sub.raw)

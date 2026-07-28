@@ -113,6 +113,9 @@ def test_the_tools_block_is_ordered_turn_loop_then_reference_then_commands():
         "Reading the Nsight Compute report — `veloq ncu`",
         "Reading the Nsight Systems timeline — `veloq nsys`",
     ]
+    timing = block.split("### Timing", 1)[1].split("### Profiling", 1)[0]
+    assert "{{" not in timing
+    assert "--test-only" in timing and "exact-shape Modal call" in timing
     assert block.index("### Profiling") < block.index("### Reading the Nsight Compute")
     assert block.index("### Reading the Nsight Compute") < block.index(
         "### Reading the Nsight Systems"

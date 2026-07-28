@@ -1,11 +1,14 @@
 ### Timing
 
-Two remote submissions on the hosted B200. Always check correctness before timing.
+Two remote submissions on the hosted B200. Always check Modal completion + correctness before timing.
 
 ```bash
-{{SCORE_CMD}} --test-only    # correctness only, ~10s, one submission
+{{SCORE_CMD}} --test-only    # exact-shape Modal call, then Popcorn correctness
 {{SCORE_CMD}}                # correctness + timing + ncu + nsys profiles, minutes
 ```
+
+If the first command reports a likely GPU kernel deadlock after 120s, do not send that
+kernel to ncu/nsys. Inspect barriers, fences, warp-collective instructions, and divergent control flow etc.
 
 ### Profiling
 

@@ -8,8 +8,8 @@ can be inspected, diffed and reviewed for free.
 
 Three properties make it worth having rather than a scratch script:
 
-- **It drives the real ``popcorn.score_command``.** Only the three network boundaries are
-  replaced (``submit`` and the two profilers); block ordering, wording, the
+- **It drives the real ``popcorn.score_command``.** Only the four network boundaries are
+  replaced (``submit``, the exact-shape check, and the two profilers); block ordering, wording, the
   ``format_*`` fold and the verdict dict all come from production code, so a change to
   any of them shows up here without this file being touched. A hand-rolled sample would
   drift the day someone edits a banner.
@@ -50,14 +50,26 @@ FIXTURES = REPO_ROOT / "tests" / "fixtures" / "popcorn"
 # the agent a reason rather than a path to a file that is not there.
 SCENARIOS = ("ok", "cached", "nsys-fail", "test-fail")
 
-# The three functions in popcorn.py that reach the network, in the order _replayed
+# The four functions in popcorn.py that reach the network, in the order _replayed
 # builds their stand-ins. Everything else on the score path is the real thing.
-_BOUNDARIES = ("submit", "profile_submission", "profile_nsys_submission")
+_BOUNDARIES = (
+    "submit",
+    "deadlock_check_submission",
+    "profile_submission",
+    "profile_nsys_submission",
+)
 
 # Nominal, from the figures in CLAUDE.md: test ~11s, benchmark ~275s over 15 shapes,
 # hosted ncu 245-270s. They are printed nowhere on stdout -- only the verdict's
 # ``bench.wall_s`` -- but a plausible number there keeps the sample readable.
-_WALL = {"test": 11.0, "benchmark": 275.0, "leaderboard": 275.0, "ncu": 262.0, "nsys": 98.0}
+_WALL = {
+    "test": 11.0,
+    "benchmark": 275.0,
+    "leaderboard": 275.0,
+    "deadlock": 18.0,
+    "ncu": 262.0,
+    "nsys": 98.0,
+}
 
 
 def _fixture(name: str) -> str:
@@ -122,6 +134,21 @@ def _replay_ncu(scenario: str) -> Callable[..., popcorn.Profile]:
     return fake
 
 
+def _replay_deadlock(scenario: str) -> Callable[..., popcorn.DeadlockCheck]:
+    def fake(cfg: Any, sub_path: Path) -> popcorn.DeadlockCheck:
+        batch, n, seed = popcorn._cholesky_modal_args(cfg)
+        return popcorn.DeadlockCheck(
+            ok=True,
+            status="passed",
+            batch=batch,
+            n=n,
+            seed=seed,
+            wall_s=_WALL["deadlock"],
+        )
+
+    return fake
+
+
 def _replay_nsys(scenario: str) -> Callable[..., popcorn.NsysProfile]:
     def fake(cfg: Any, sub_path: Path, dest: Path, digest: str) -> popcorn.NsysProfile:
         if scenario == "nsys-fail":
@@ -149,7 +176,12 @@ def _replayed(scenario: str) -> Iterator[None]:
     leaked patch would make every later popcorn test score against a fixture.
     """
     real = {name: getattr(popcorn, name) for name in _BOUNDARIES}
-    fakes = (_replay_submit(scenario), _replay_ncu(scenario), _replay_nsys(scenario))
+    fakes = (
+        _replay_submit(scenario),
+        _replay_deadlock(scenario),
+        _replay_ncu(scenario),
+        _replay_nsys(scenario),
+    )
     for name, fake in zip(_BOUNDARIES, fakes, strict=True):
         setattr(popcorn, name, fake)
     try:

@@ -86,6 +86,9 @@ def _problem(tmp_path, **popcorn_cfg) -> Problem:
         # profiler. The tests that do exercise profiling stub the profiler calls.
         "profile": False,
         "nsys": False,
+        # Most scoring tests isolate Popcorn parsing. Dedicated tests below turn this
+        # on and stub the Modal boundary to verify --test-only ordering.
+        "deadlock_check": False,
     }
     cfg.update(popcorn_cfg)
     (tmp_path / "submission.py").write_text("def custom_kernel(data):\n    return data\n")
@@ -556,6 +559,64 @@ def test_test_only_skips_the_timing_run(tmp_path, monkeypatch):
     assert seen == ["test"]
 
 
+def test_test_only_runs_exact_modal_check_before_popcorn_correctness(tmp_path, monkeypatch):
+    seen: list[str] = []
+
+    def fake_deadlock(cfg, sub_path):
+        seen.append("modal")
+        return popcorn.DeadlockCheck(
+            ok=True,
+            status="passed",
+            batch=256,
+            n=128,
+            seed=41128,
+            wall_s=18.0,
+        )
+
+    monkeypatch.setattr(popcorn, "deadlock_check_submission", fake_deadlock)
+    _fake_submit(monkeypatch, {"test": TEST_OK}, seen)
+    correct, metric, err, detail = popcorn.score(
+        _problem(tmp_path, deadlock_check=True), tmp_path, test_only=True
+    )
+
+    assert (correct, metric, err) == (True, None, None)
+    assert seen == ["modal", "test"]
+    assert detail["deadlock_check"]["deadlock_check"] == "passed"
+    assert detail["test"]["passed"] == 17
+
+
+def test_test_only_deadlock_timeout_never_reaches_popcorn(tmp_path, monkeypatch):
+    seen: list[str] = []
+    error = (
+        "exact-shape Modal run exceeded 120s while executing custom_kernel; "
+        "likely GPU kernel deadlock. Do not start NCU or NSYS."
+    )
+    monkeypatch.setattr(
+        popcorn,
+        "deadlock_check_submission",
+        lambda cfg, sub_path: popcorn.DeadlockCheck(
+            ok=False,
+            status="timed_out",
+            batch=256,
+            n=128,
+            seed=41128,
+            wall_s=120.0,
+            timed_out=True,
+            error=error,
+        ),
+    )
+    _fake_submit(monkeypatch, {}, seen)
+    correct, metric, err, detail = popcorn.score(
+        _problem(tmp_path, deadlock_check=True), tmp_path, test_only=True
+    )
+
+    assert (correct, metric) == (False, None)
+    assert err == error
+    assert seen == []
+    assert "test" not in detail
+    assert detail["deadlock_check"]["timed_out"] is True
+
+
 def test_benchmark_index_out_of_range_is_an_error_not_a_crash(tmp_path, monkeypatch):
     _fake_submit(monkeypatch, {"test": TEST_OK, "benchmark": BENCHMARK_OK})
     correct, metric, err, _ = popcorn.score(_problem(tmp_path, benchmark_index=99), tmp_path)
@@ -852,9 +913,11 @@ def test_a_broken_kernel_never_reaches_the_profiler_queue(tmp_path, monkeypatch)
     assert "profile" not in detail and "nsys" not in detail
 
 
-def test_test_only_stays_cheap_by_default(tmp_path, monkeypatch):
-    """--test-only is the ~10s correctness call an agent makes most; a capture would make
-    it ~25x slower and produces no timing to reason about. Explicit --profile overrides."""
+def test_test_only_never_profiles_by_default(tmp_path, monkeypatch):
+    """The Modal completion check is unprofiled; --test-only must still avoid NCU/NSYS.
+
+    Explicit ``profile=True`` remains the narrow test hook that overrides this.
+    """
     seen: list[str] = []
     seen_nsys: list[str] = []
     _fake_submit(monkeypatch, {"test": TEST_OK})
@@ -923,6 +986,117 @@ def test_nsys_requires_shape_fields_before_modal(tmp_path):
     )
     assert prof.ok is False
     assert "requires benchmark_spec fields" in prof.error
+
+
+def test_deadlock_check_runs_one_exact_shape_call_with_remote_timeout(tmp_path, monkeypatch):
+    cfg = popcorn.PopcornConfig(
+        leaderboard="cholesky",
+        benchmark_index=TARGET_INDEX,
+        benchmark_spec=TARGET_SPEC,
+        cache=False,
+    )
+    sub_path = tmp_path / "submission.py"
+    sub_path.write_text("def custom_kernel(data):\n    return data\n", encoding="utf-8")
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["kwargs"] = kwargs
+
+        class Result:
+            returncode = 0
+            stderr = ""
+            stdout = json.dumps(
+                {
+                    "kind": "kernelthing-deadlock-check",
+                    "status": "passed",
+                    "ok": True,
+                    "timed_out": False,
+                    "wall_s": 17.25,
+                }
+            )
+
+        return Result()
+
+    monkeypatch.setattr(popcorn, "modal_bin", lambda: "/modal")
+    monkeypatch.setattr(popcorn.subprocess, "run", fake_run)
+    check = popcorn.deadlock_check_submission(cfg, sub_path)
+
+    assert check.ok is True and check.status == "passed"
+    assert (check.batch, check.n, check.seed) == (256, 128, 41128)
+    assert check.wall_s == pytest.approx(17.25)
+    assert seen["kwargs"]["timeout"] == popcorn.DEADLOCK_CHECK_CLIENT_TIMEOUT_S
+    assert "--completion-check" in seen["cmd"]
+    for flag, value in (
+        ("--batch", "256"),
+        ("--n", "128"),
+        ("--seed", "41128"),
+        ("--deadlock-timeout-s", "120"),
+    ):
+        assert seen["cmd"][seen["cmd"].index(flag) + 1] == value
+
+
+def test_deadlock_check_reports_remote_120s_timeout_as_likely_deadlock(
+    tmp_path, monkeypatch
+):
+    cfg = popcorn.PopcornConfig(
+        leaderboard="cholesky",
+        benchmark_spec=TARGET_SPEC,
+        cache=False,
+    )
+    sub_path = tmp_path / "submission.py"
+    sub_path.write_text("def custom_kernel(data):\n    return data\n", encoding="utf-8")
+
+    def fake_run(cmd, **kwargs):
+        class Result:
+            returncode = 0
+            stderr = ""
+            stdout = json.dumps(
+                {
+                    "kind": "kernelthing-deadlock-check",
+                    "status": "timed_out",
+                    "ok": False,
+                    "timed_out": True,
+                    "wall_s": 120.0,
+                    "error": (
+                        "exact-shape Modal run exceeded 120s while executing custom_kernel; "
+                        "likely GPU kernel deadlock. Do not start NCU or NSYS."
+                    ),
+                }
+            )
+
+        return Result()
+
+    monkeypatch.setattr(popcorn, "modal_bin", lambda: "/modal")
+    monkeypatch.setattr(popcorn.subprocess, "run", fake_run)
+    check = popcorn.deadlock_check_submission(cfg, sub_path)
+
+    assert check.ok is False and check.status == "timed_out" and check.timed_out is True
+    assert "likely GPU kernel deadlock" in check.error
+    assert "Do not start NCU or NSYS" in check.error
+
+
+def test_deadlock_check_client_timeout_is_not_misclassified_as_kernel_deadlock(
+    tmp_path, monkeypatch
+):
+    cfg = popcorn.PopcornConfig(
+        leaderboard="cholesky",
+        benchmark_spec=TARGET_SPEC,
+        cache=False,
+    )
+    sub_path = tmp_path / "submission.py"
+    sub_path.write_text("def custom_kernel(data):\n    return data\n", encoding="utf-8")
+
+    def fake_run(cmd, **kwargs):
+        raise popcorn.subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(popcorn, "modal_bin", lambda: "/modal")
+    monkeypatch.setattr(popcorn.subprocess, "run", fake_run)
+    check = popcorn.deadlock_check_submission(cfg, sub_path)
+
+    assert check.ok is False and check.timed_out is False
+    assert "scheduling/startup failure" in check.error
+    assert "not a classified kernel deadlock" in check.error
 
 
 def test_the_verdict_carries_paths_not_capture_text(tmp_path, monkeypatch):

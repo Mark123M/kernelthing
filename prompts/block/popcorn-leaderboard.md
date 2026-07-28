@@ -7,7 +7,8 @@ it and fill the board with dead ends. Deciding what gets ranked is not yours to 
 
 Everything you actually need to iterate is available:
 
-- `--test-only` on the scorer — correctness, one submission, fastest.
+- `--test-only` on the scorer — one unprofiled call at the exact scored shape on
+  Modal/B200 with a 120s timeout, followed by Popcorn correctness.
 - The scorer with no flags — correctness, the metric you are being ranked on within
   this search, *and* an Nsight Compute profile of the scored shape, captured on the
   competition hardware and printed above the verdict. You do not have to ask for it.

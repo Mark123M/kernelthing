@@ -22,7 +22,7 @@ mypy kernelthing                       # strict; tests/vendor/problems/sandbox e
 
 kernelthing problems/<name> -j 8       # run the loop; web UI at http://127.0.0.1:8765
 kernelthing score <problem-dir>        # authoritative scorer, prints {correct, metric, unit}
-kernelthing score <dir> --test-only    # correctness only; halves the cost on popcorn problems
+kernelthing score <dir> --test-only    # exact-shape Modal call, then Popcorn correctness
 kernelthing score <dir> --brief        # verdict without the bench record (what agents run)
 kernelthing score <dir> --dry-run      # submit nothing: replay what an agent reads, from fixtures
 kernelthing score <dir> --dry-run cached|nsys-fail|test-fail   # ...the degraded blocks
@@ -217,8 +217,8 @@ Consequences worth knowing before editing it:
   after the benchmark returns** (`profile_submission`, `profile_nsys_submission`,
   `PROFILE_TIMEOUT_S`). Agents no longer decide to profile; every full score arrives with both when
   configured. Details in "Automatic profiling" below.
-- **Nothing local touches a GPU.** `kernelthing score` takes `[dir]`, `--test-only` and
-  `--no-profile`; there is no `--gpu` / baseline plumbing. The metric is an absolute
+- **Nothing local touches a GPU.** `kernelthing score` takes `[dir]`, `--test-only`
+  and `--no-profile`; there is no `--gpu` / baseline plumbing. The metric is an absolute
   time, so there is no baseline to pin — `_evolve_seed` scores the seed once and moves on.
 - The metric is a **time in microseconds, so these problems set `direction: minimize`.**
   `bench.popcorn.metric_mode` picks *which* time: `shape` (one `benchmark_index`, the default — a
@@ -330,9 +330,12 @@ a minimal Modal/B200 Nsight Systems timeline for Cholesky problems:
   work is the long pole (hosted ncu is 245–270s alone, 515s observed behind a queue) and the
   benchmark is ~172s, so overlapping costs the difference rather than the sum. A broken kernel
   returns before the captures start and never takes a profiler slot.
-- **`--test-only` never profiles by default.** It is the ~10s call an agent makes most while
-  iterating on correctness; a capture would make it ~25× slower and there is no timing to reason
-  about yet. `--no-profile` suppresses both profilers on a full score.
+- **`--test-only` never profiles by default.** For Cholesky it first performs one
+  unprofiled `custom_kernel` call on Modal/B200 at the exact `benchmark_spec` shape,
+  then submits the Popcorn correctness suite only if that call returns. The remote
+  child process has a 120s timeout and returns an explicit likely-deadlock warning; a
+  separate 300s client cap classifies Modal scheduling/startup failure without blaming
+  the kernel. `--no-profile` suppresses both profilers on a full score.
 - **Neither does the seed** (`_evolve_seed` passes `no_profile=True`), and that is the one place
   where *not* capturing is the feature. `_evolve_seed` removes the seed worktree in its `finally`
   seconds after the score returns, so a capture taken there is deleted before anything reads it —
@@ -424,8 +427,9 @@ feedback channel and was invisible until a real submission had been paid for.
 `kernelthing score <dir> --dry-run [SCENARIO]` replays it from `tests/fixtures/popcorn/`.
 Three properties are the whole point, and are what `tests/test_dryrun.py` holds:
 
-- **It drives the real `popcorn.score_command`.** Only the three network boundaries are
-  swapped (`_BOUNDARIES` = `submit`, `profile_submission`, `profile_nsys_submission`), so
+- **It drives the real `popcorn.score_command`.** Only the four network boundaries are
+  swapped (`_BOUNDARIES` = `submit`, `deadlock_check_submission`,
+  `profile_submission`, `profile_nsys_submission`), so
   block order, wording and the verdict dict all come from production code — edit a banner
   and the replay follows without `dryrun.py` being touched. `test_stdout_is_the_production_fold_and_carries_no_dry_run_marker`
   re-renders the blocks from the verdict's own `bench` dict and demands equality.
@@ -446,7 +450,8 @@ Three properties are the whole point, and are what `tests/test_dryrun.py` holds:
   under `_replayed` directly (a better check than a flag existing to be looked at), and
   every archived run already has 20-odd `result.json` files showing its shape.
 
-`--test-only` / `--no-profile` are not re-implemented; they reach `score` unchanged.
+`--test-only` / `--no-profile` are not re-implemented; they reach production command
+handling unchanged.
 The scenarios exist because the degraded blocks are the ones nobody sees until they happen
 in a run: `cached` (the 80MB report is not re-downloaded, so there is no path to query),
 `nsys-fail` (a reason instead of a path, and the directive drops to naming ncu alone),

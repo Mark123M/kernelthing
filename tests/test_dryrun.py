@@ -83,8 +83,14 @@ def test_a_dry_run_submits_nothing_and_writes_nothing(capsys, monkeypatch):
     def explode(*a, **k):
         raise AssertionError("the network boundary was reached during a dry run")
 
-    real = (popcorn.submit, popcorn.profile_submission, popcorn.profile_nsys_submission)
+    real = (
+        popcorn.submit,
+        popcorn.deadlock_check_submission,
+        popcorn.profile_submission,
+        popcorn.profile_nsys_submission,
+    )
     monkeypatch.setattr(popcorn, "submit", explode)
+    monkeypatch.setattr(popcorn, "deadlock_check_submission", explode)
     monkeypatch.setattr(popcorn, "profile_submission", explode)
     monkeypatch.setattr(popcorn, "profile_nsys_submission", explode)
     monkeypatch.setattr(popcorn, "_cache_store", explode)
@@ -96,7 +102,13 @@ def test_a_dry_run_submits_nothing_and_writes_nothing(capsys, monkeypatch):
     assert set(PROBLEM.rglob("*")) == before
     assert not (PROBLEM / popcorn.PROFILE_DIR).exists()
     # restored to whatever they were on entry, not to the module originals
-    assert (popcorn.submit, popcorn.profile_submission, popcorn.profile_nsys_submission) == (
+    assert (
+        popcorn.submit,
+        popcorn.deadlock_check_submission,
+        popcorn.profile_submission,
+        popcorn.profile_nsys_submission,
+    ) == (
+        explode,
         explode,
         explode,
         explode,
@@ -135,8 +147,7 @@ def test_a_broken_kernel_exits_nonzero_and_never_reaches_a_capture(capsys):
 
 
 def test_the_real_flags_apply_to_the_replay(capsys):
-    """--test-only and --no-profile are not re-implemented here; they reach ``score``
-    unchanged, which is what makes the replay a demonstration rather than a mock-up."""
+    """The real mode flags reach production command handling under replay."""
     _, blocks, verdict = _run(capsys, "--dry-run", "--test-only")
     assert blocks == "" and verdict["metric"] is None and verdict["correct"] is True
     _, blocks, verdict = _run(capsys, "--dry-run", "--no-profile")

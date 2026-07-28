@@ -196,8 +196,8 @@ def score_command(argv: list[str]) -> int:
         "--test-only",
         action="store_true",
         default=False,
-        help="check correctness only, skipping the timing run: the cheap pre-check "
-        "(one popcorn submission instead of two). Prints no metric.",
+        help="run one exact-shape Modal/B200 completion check, then the Popcorn "
+        "correctness suite; skip timing and profiling, and print no metric",
     )
     # Unset defers to bench.popcorn.profile, which captures on a full score and not on
     # --test-only. There is deliberately no --profile to go with this: profiling is not

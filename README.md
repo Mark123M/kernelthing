@@ -152,6 +152,12 @@ hosted Nsight Compute via popcorn, and a minimal Modal/B200 Nsight Systems timel
 Cholesky problems. Artifacts land under `profile/latest/` and `profile/latest/nsys/`.
 `kernelthing score --no-profile` skips both captures.
 
+Before a full score, `kernelthing score <dir> --test-only` calls `custom_kernel` once
+on Modal/B200 at the exact configured benchmark shape, then runs the Popcorn
+correctness suite. A 120-second remote execution timeout reports a likely kernel
+deadlock and prevents the Popcorn call; Modal scheduling/startup failures are reported
+separately.
+
 ## GPU profiling permission (for ncu)
 
 NVIDIA drivers restrict performance counters to admins by default. The agent runs
